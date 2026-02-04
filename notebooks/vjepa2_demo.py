@@ -18,6 +18,8 @@ import src.datasets.utils.video.volume_transforms as volume_transforms
 from src.models.attentive_pooler import AttentiveClassifier
 from src.models.vision_transformer import vit_giant_xformers_rope
 
+import matplotlib.pyplot as plt
+
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
 
@@ -96,6 +98,105 @@ def get_vjepa_video_classification_results(classifier, out_patch_features_pt):
     return
 
 
+def plot_distance_to_goal(vectors, goal_vector=None, save_path="distance_to_goal.png"):
+    """
+    Plots the L2 distance of a sequence of vectors to a goal vector.
+
+    Args:
+        vectors (torch.Tensor or np.ndarray): Sequence of latent vectors (T, D).
+        goal_vector (torch.Tensor or np.ndarray, optional): The goal state vector (D,).
+                                                            If None, use the last vector in the sequence.
+        save_path (str): Path to save the plot.
+    """
+    if isinstance(vectors, np.ndarray):
+        vectors = torch.from_numpy(vectors)
+    if goal_vector is not None and isinstance(goal_vector, np.ndarray):
+        goal_vector = torch.from_numpy(goal_vector)
+
+    if goal_vector is None:
+        goal_vector = vectors[-1]
+
+    # Calculate L2 distances
+    # vectors: (T, D), goal_vector: (D,)
+    diff = vectors - goal_vector.unsqueeze(0)  # (T, D)
+    distances = torch.norm(diff, p=2, dim=1).cpu().numpy()
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(distances, marker="o", linestyle="-")
+    plt.xlabel("Time Step")
+    plt.ylabel("L2 Distance to Goal")
+    plt.title("Distance to Goal State over Time")
+    plt.grid(True)
+    plt.savefig(save_path)
+    print(f"Distance plot saved to {save_path}")
+    plt.close()
+
+
+def extract_video_vectors(model, transform, video_path, mode="single_frame", tau=16, device="cuda"):
+    """
+    Extracts latent vectors from a video using the VJEPA model.
+
+    Args:
+        model (torch.nn.Module): The VJEPA model.
+        transform (callable): Video transform function.
+        video_path (str): Path to the video file.
+        mode (str): 'single_frame' or 'clip'.
+                    'single_frame': Encodes each frame as a state (duplicating to meet model input reqs).
+                    'clip': Encodes a clip of length tau ending at t as the state at t.
+        tau (int): Window size for 'clip' mode.
+        device (str): Device to run inference on.
+
+    Returns:
+        torch.Tensor: Sequence of state vectors (T, D).
+    """
+    vr = VideoReader(video_path)
+    total_frames = len(vr)
+    vectors = []
+
+    print(f"Extracting vectors from {video_path} (frames: {total_frames}, mode: {mode})")
+
+    indices = []
+    if mode == "single_frame":
+        indices = range(total_frames)
+    elif mode == "clip":
+        # Start from tau so we have a full clip [t-tau, t)
+        indices = range(tau, total_frames + 1)
+
+    for t in indices:
+        if mode == "single_frame":
+            # Extract single frame
+            frame = vr[t].asnumpy()  # H, W, C
+            # Duplicate to satisfy temporal dimension if needed (e.g. tubelet_size=2)
+            clip = [frame, frame]
+        elif mode == "clip":
+            # Extract clip [t-tau, t)
+            clip_indices = range(t - tau, t)
+            clip = vr.get_batch(clip_indices).asnumpy()  # (tau, H, W, C)
+            clip = list(clip)
+
+        # Transform
+        # Transform expects list of numpy arrays (H, W, C)
+        # Returns (C, T, H, W) tensor
+        x = transform(clip)
+        x = x.unsqueeze(0).to(device)  # (1, C, T, H, W)
+
+        with torch.inference_mode():
+            # Model output: (1, N_patches, D)
+            features = model(x)
+            # Average pool patches to get single state vector
+            embedding = features.mean(dim=1).squeeze(0)  # (D,)
+
+        vectors.append(embedding.cpu())
+
+        if t % 50 == 0:
+            print(f"Processed {t}/{len(indices)}")
+
+    if not vectors:
+        return torch.empty(0)
+
+    return torch.stack(vectors)  # (T, D)
+
+
 def run_sample_inference():
     # HuggingFace model repo name
     hf_model_name = (
@@ -164,6 +265,31 @@ def run_sample_inference():
         print("Downloading SSV2 classes")
 
     get_vjepa_video_classification_results(classifier, out_patch_features_pt)
+
+    # --- New Demo: Extract Vectors and Plot Progress ---
+    print("\n--- Running Video Vector Extraction Demo ---")
+    # Use PyTorch model and transform
+    # Extract using single frame mode
+    # Note: Processing all frames might take time.
+    vectors_single = extract_video_vectors(
+        model_pt,
+        pt_video_transform,
+        sample_video_path,
+        mode="single_frame",
+        device="cuda",
+    )
+    plot_distance_to_goal(vectors_single, save_path="distance_single_frame.png")
+
+    # Extract using clip mode
+    vectors_clip = extract_video_vectors(
+        model_pt,
+        pt_video_transform,
+        sample_video_path,
+        mode="clip",
+        tau=16,
+        device="cuda",
+    )
+    plot_distance_to_goal(vectors_clip, save_path="distance_clip.png")
 
 
 if __name__ == "__main__":
