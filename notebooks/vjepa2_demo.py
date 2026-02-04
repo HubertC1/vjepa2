@@ -10,7 +10,7 @@ import subprocess
 import numpy as np
 import torch
 import torch.nn.functional as F
-from decord import VideoReader
+import torchvision.io as io
 from transformers import AutoModel, AutoVideoProcessor
 
 import src.datasets.utils.video.transforms as video_transforms
@@ -57,19 +57,36 @@ def build_pt_video_transform(img_size):
     return eval_transform
 
 
-def get_video():
-    vr = VideoReader("sample_video.mp4")
+def get_video(video_path):
+    # Read video using torchvision
+    # returns: video (Tensor[T, H, W, C]), audio, info
+    video, _, _ = io.read_video(video_path, pts_unit="sec", output_format="TCHW")
+    
     # choosing some frames here, you can define more complex sampling strategy
+    # Ensure we don't go out of bounds if video is short
+    total_frames = video.shape[0]
     frame_idx = np.arange(0, 128, 2)
-    video = vr.get_batch(frame_idx).asnumpy()
+    if len(frame_idx) > 0 and frame_idx[-1] >= total_frames:
+        frame_idx = frame_idx[frame_idx < total_frames]
+
+    # Convert to numpy and rearrange to T, H, W, C for consistency with previous decord output if needed,
+    # BUT forward_vjepa_video expects T x C x H x W immediately after or handles it.
+    # Previous decord code:
+    # video = vr.get_batch(frame_idx).asnumpy() (T, H, W, C)
+    # Then forward_vjepa_video did: torch.from_numpy(video).permute(0, 3, 1, 2)
+    
+    # torchvision read_video with output_format="TCHW" gives (T, C, H, W).
+    # We will return it as T, H, W, C numpy array to minimize changes in forward_vjepa_video
+    
+    video = video[frame_idx].permute(0, 2, 3, 1).numpy()
     return video
 
 
-def forward_vjepa_video(model_hf, model_pt, hf_transform, pt_transform):
+def forward_vjepa_video(model_hf, model_pt, hf_transform, pt_transform, video_path):
     # Run a sample inference with VJEPA
     with torch.inference_mode():
         # Read and pre-process the image
-        video = get_video()  # T x H x W x C
+        video = get_video(video_path)  # T x H x W x C
         video = torch.from_numpy(video).permute(0, 3, 1, 2)  # T x C x H x W
         x_pt = pt_transform(video).cuda().unsqueeze(0)
         x_hf = hf_transform(video, return_tensors="pt")["pixel_values_videos"].to("cuda")
@@ -132,7 +149,9 @@ def plot_distance_to_goal(vectors, goal_vector=None, save_path="distance_to_goal
     plt.close()
 
 
-def extract_video_vectors(model, transform, video_path, mode="single_frame", tau=16, device="cuda"):
+def extract_video_vectors(
+    model, transform, video_path, mode="single_frame", tau=16, stride=1, device="cuda"
+):
     """
     Extracts latent vectors from a video using the VJEPA model.
 
@@ -144,35 +163,44 @@ def extract_video_vectors(model, transform, video_path, mode="single_frame", tau
                     'single_frame': Encodes each frame as a state (duplicating to meet model input reqs).
                     'clip': Encodes a clip of length tau ending at t as the state at t.
         tau (int): Window size for 'clip' mode.
+        stride (int): Stride for sampling frames.
         device (str): Device to run inference on.
 
     Returns:
         torch.Tensor: Sequence of state vectors (T, D).
     """
-    vr = VideoReader(video_path)
-    total_frames = len(vr)
+    # Read video using torchvision
+    # returns: video (Tensor[T, H, W, C]), audio, info
+    # We load the full video first. For very long videos, this might be memory intensive.
+    video, _, _ = io.read_video(video_path, pts_unit="sec", output_format="TCHW")
+    # video is (T, C, H, W)
+
+    total_frames = video.shape[0]
     vectors = []
 
     print(f"Extracting vectors from {video_path} (frames: {total_frames}, mode: {mode})")
 
     indices = []
     if mode == "single_frame":
-        indices = range(total_frames)
+        indices = range(0, total_frames, stride)
     elif mode == "clip":
         # Start from tau so we have a full clip [t-tau, t)
-        indices = range(tau, total_frames + 1)
+        indices = range(tau, total_frames + 1, stride)
 
-    for t in indices:
+    for i, t in enumerate(indices):
         if mode == "single_frame":
             # Extract single frame
-            frame = vr[t].asnumpy()  # H, W, C
+            # frame is (C, H, W) -> need (H, W, C) for transform compatibility
+            frame = video[t].permute(1, 2, 0).numpy() 
             # Duplicate to satisfy temporal dimension if needed (e.g. tubelet_size=2)
             clip = [frame, frame]
         elif mode == "clip":
             # Extract clip [t-tau, t)
-            clip_indices = range(t - tau, t)
-            clip = vr.get_batch(clip_indices).asnumpy()  # (tau, H, W, C)
-            clip = list(clip)
+            # clip_indices = range(t - tau, t)
+            # video[start:end] works
+            clip_tensor = video[t - tau : t] # (tau, C, H, W)
+            # Convert to list of numpy arrays (H, W, C)
+            clip = [c.permute(1, 2, 0).numpy() for c in clip_tensor]
 
         # Transform
         # Transform expects list of numpy arrays (H, W, C)
@@ -188,8 +216,8 @@ def extract_video_vectors(model, transform, video_path, mode="single_frame", tau
 
         vectors.append(embedding.cpu())
 
-        if t % 50 == 0:
-            print(f"Processed {t}/{len(indices)}")
+        if i % 50 == 0:
+            print(f"Processed {i}/{len(indices)}")
 
     if not vectors:
         return torch.empty(0)
@@ -205,11 +233,16 @@ def run_sample_inference():
     # Path to local PyTorch weights
     pt_model_path = "/tmp2/hubertchang/p-progress/models/vitg-384.pt"
 
-    sample_video_path = "sample_video.mp4"
+    # --- USER CONFIGURATION ---
+    # Change this variable to choose another video path
+    # target_video_path = "sample_video.mp4"
+    target_video_path = "/home/hubertchang/p-progress/vjepa2/episode_000000.mp4"
+    # --------------------------
+
     # Download the video if not yet downloaded to local path
-    if not os.path.exists(sample_video_path):
+    if target_video_path == "sample_video.mp4" and not os.path.exists(target_video_path):
         video_url = "https://huggingface.co/datasets/nateraw/kinetics-mini/resolve/main/val/bowling/-WH-lxmGJVY_000005_000015.mp4"
-        command = ["wget", video_url, "-O", sample_video_path]
+        command = ["wget", video_url, "-O", target_video_path]
         subprocess.run(command)
         print("Downloading video")
 
@@ -231,7 +264,7 @@ def run_sample_inference():
 
     # Inference on video
     out_patch_features_hf, out_patch_features_pt = forward_vjepa_video(
-        model_hf, model_pt, hf_transform, pt_video_transform
+        model_hf, model_pt, hf_transform, pt_video_transform, target_video_path
     )
 
     print(
@@ -274,8 +307,9 @@ def run_sample_inference():
     vectors_single = extract_video_vectors(
         model_pt,
         pt_video_transform,
-        sample_video_path,
+        target_video_path,
         mode="single_frame",
+        stride=2,
         device="cuda",
     )
     plot_distance_to_goal(vectors_single, save_path="distance_single_frame.png")
@@ -284,9 +318,10 @@ def run_sample_inference():
     vectors_clip = extract_video_vectors(
         model_pt,
         pt_video_transform,
-        sample_video_path,
+        target_video_path,
         mode="clip",
         tau=16,
+        stride=2,  # Match tubelet_size (2) to avoid aliasing artifacts
         device="cuda",
     )
     plot_distance_to_goal(vectors_clip, save_path="distance_clip.png")
