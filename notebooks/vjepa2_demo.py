@@ -20,6 +20,10 @@ from src.models.vision_transformer import vit_giant_xformers_rope
 
 import matplotlib.pyplot as plt
 from scipy.stats import spearmanr
+try:
+    from moviepy.editor import VideoFileClip
+except ImportError:
+    from moviepy import VideoFileClip
 
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
@@ -127,7 +131,15 @@ def calculate_monotonicity_score(values):
         return 0.0
     
     indices = np.arange(len(values))
+    # Handle constant values (std=0) which cause spearmanr to return NaN
+    if np.all(values == values[0]):
+        return 0.0 # No trend
+        
     correlation, _ = spearmanr(indices, values)
+    
+    if np.isnan(correlation):
+        return 0.0
+        
     return correlation
 
 
@@ -290,6 +302,155 @@ def extract_video_vectors(
     return torch.stack(vectors), timestamps
 
 
+def discover_subgoals(vectors, timestamps, threshold=0.0):
+    """
+    Identifies subgoals by tracking distance monotonicity backwards from the end.
+    
+    Args:
+        vectors (torch.Tensor): Sequence of latent vectors (T, D).
+        timestamps (list): Time values.
+        threshold (float): Monotonicity score threshold. If score > threshold, trigger subgoal.
+                           Score is Spearman correlation (-1 to 1). 
+                           -1 is perfect decreasing distance (good).
+                           Higher values imply non-decreasing or increasing distance (bad).
+                           
+    Returns:
+        tuple: (goals, dynamic_distances)
+            goals (list): Indices of discovered subgoals (sorted ascending).
+            dynamic_distances (np.ndarray): Distance of each frame to its assigned future goal.
+    """
+    T = len(vectors)
+    if T == 0:
+        return [], np.array([])
+
+    # Indices of identified goals. Start with the last frame.
+    goals = [T - 1]
+    
+    # Array to store the "Distance to Current Goal" for each frame
+    dynamic_distances = np.zeros(T)
+    
+    # Current active goal index (initially the last frame)
+    current_goal_idx = T - 1
+    
+    print(f"Discovering subgoals (Backwards, Threshold={threshold})...")
+    
+    # Iterate backwards from the frame before the last one
+    for t in range(T - 2, -1, -1):
+        # Current segment: [t, ..., current_goal_idx]
+        segment_vectors = vectors[t : current_goal_idx + 1]
+        target_goal = vectors[current_goal_idx]
+        
+        # Calculate distances for this segment to the target goal
+        diff = segment_vectors - target_goal.unsqueeze(0)
+        dists = torch.norm(diff, p=2, dim=1).cpu().numpy()
+        
+        # Calculate monotonicity
+        # We want distances to decrease as time index increases (t -> goal)
+        score = calculate_monotonicity_score(dists)
+        
+        # Store distance for current frame t
+        dynamic_distances[t] = dists[0]
+
+        # Check if monotonicity is broken
+        # We need a minimum segment size to trust the correlation (e.g. > 3 frames)
+        if len(dists) >= 4 and score > threshold:
+             # Violation! The curve is not monotonic enough.
+             # Use current frame t as new goal.
+             current_goal_idx = t
+             goals.append(t)
+             
+             # Reset distance for t to 0 (since it's now the goal)
+             dynamic_distances[t] = 0.0
+             
+             # Debug print (optional, can be noisy)
+             # print(f"  New subgoal found at t={t} ({timestamps[t]:.2f}s) | Score: {score:.3f}")
+             
+    # Ensure goals are sorted (they are appended in reverse order)
+    goals = sorted(goals)
+    
+    # Handle end case
+    dynamic_distances[T-1] = 0.0
+    
+    return goals, dynamic_distances
+
+
+def plot_subgoal_discovery(timestamps, distances, goals, save_path="subgoal_discovery.png"):
+    plt.figure(figsize=(12, 6))
+    plt.plot(timestamps, distances, label="Distance to Dynamic Goal", linewidth=1.5)
+    
+    # Plot goal markers
+    goal_times = [timestamps[g] for g in goals]
+    goal_dists = [distances[g] for g in goals] 
+    plt.scatter(goal_times, goal_dists, c='red', marker='x', s=100, label="Discovered Subgoals", zorder=5)
+    
+    for gt in goal_times:
+        plt.axvline(x=gt, color='r', linestyle='--', alpha=0.3)
+
+    plt.xlabel("Time (s)")
+    plt.ylabel("L2 Distance to Current Subgoal")
+    plt.title(f"Unsupervised Subgoal Discovery\n(Backwards Monotonicity Tracking) | Found {len(goals)} goals")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(save_path)
+    print(f"Subgoal plot saved to {save_path} | Found {len(goals)} subgoals")
+    plt.close()
+
+
+def save_subgoal_videos(video_path, timestamps, goals, output_dir="subgoal_videos"):
+    """
+    Saves video clips for each discovered subgoal segment.
+
+    Args:
+        video_path (str): Path to original video.
+        timestamps (list): Timestamps for each frame/vector index.
+        goals (list): Indices of discovered subgoals (sorted ascending).
+        output_dir (str): Directory to save clips.
+    """
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    print(f"Saving {len(goals)} subgoal clips to {output_dir}/ ...")
+    
+    try:
+        clip = VideoFileClip(video_path)
+        
+        # Determine start time of video analysis
+        # If we started at t=0, start_time is 0. If we had an offset (e.g. clip mode tau), 
+        # timestamps[0] handles that.
+        start_time = 0.0
+        
+        for i, goal_idx in enumerate(goals):
+            end_time = timestamps[goal_idx]
+            
+            # Clip end_time to video duration to avoid errors
+            if end_time > clip.duration:
+                print(f"  Adjusting end time from {end_time:.2f}s to video duration {clip.duration:.2f}s")
+                end_time = clip.duration
+            
+            # Ensure valid clip duration
+            if end_time > start_time:
+                # MoviePy 2.x uses .subclipped() instead of .subclip()
+                if hasattr(clip, "subclipped"):
+                    subclip = clip.subclipped(start_time, end_time)
+                else:
+                    subclip = clip.subclip(start_time, end_time)
+                
+                output_filename = os.path.join(output_dir, f"subgoal_{i+1:02d}.mp4")
+                subclip.write_videofile(output_filename, codec="libx264", audio_codec="aac")
+                print(f"  Saved {output_filename} ({start_time:.2f}s -> {end_time:.2f}s)")
+            else:
+                print(f"  Skipping subgoal {i+1}: duration too short ({start_time:.2f}s -> {end_time:.2f}s)")
+            
+            # Next clip starts where this one ended
+            start_time = end_time
+            
+        clip.close()
+        print("All clips saved.")
+
+    except Exception as e:
+        print(f"Error saving video clips: {e}")
+
+
 def run_sample_inference():
     # HuggingFace model repo name
     hf_model_name = (
@@ -369,15 +530,15 @@ def run_sample_inference():
     # Use PyTorch model and transform
     # Extract using single frame mode
     # Note: Processing all frames might take time.
-    vectors_single, timestamps_single = extract_video_vectors(
-        model_pt,
-        pt_video_transform,
-        target_video_path,
-        mode="single_frame",
-        stride=2,
-        device="cuda",
-    )
-    plot_distance_to_goal(vectors_single, timestamps=timestamps_single, save_path="distance_single_frame.png")
+    # vectors_single, timestamps_single = extract_video_vectors(
+    #     model_pt,
+    #     pt_video_transform,
+    #     target_video_path,
+    #     mode="single_frame",
+    #     stride=2,
+    #     device="cuda",
+    # )
+    # plot_distance_to_goal(vectors_single, timestamps=timestamps_single, save_path="distance_single_frame.png")
 
     # Extract using clip mode
     vectors_clip, timestamps_clip = extract_video_vectors(
@@ -389,7 +550,16 @@ def run_sample_inference():
         stride=2,  # Match tubelet_size (2) to avoid aliasing artifacts
         device="cuda",
     )
-    plot_distance_to_goal(vectors_clip, timestamps=timestamps_clip, save_path="distance_clip.png")
+    # plot_distance_to_goal(vectors_clip, timestamps=timestamps_clip, save_path="distance_clip.png")
+
+    # --- New Demo: Subgoal Discovery ---
+    # We use the clip vectors as they are usually smoother/more robust
+    print("\n--- Running Subgoal Discovery Demo ---")
+    goals, dynamic_dists = discover_subgoals(vectors_clip, timestamps_clip, threshold=-0.7)
+    plot_subgoal_discovery(timestamps_clip, dynamic_dists, goals, save_path="subgoal_discovery.png")
+
+    # Save video clips for discovered subgoals
+    save_subgoal_videos(target_video_path, timestamps_clip, goals)
 
 
 if __name__ == "__main__":
