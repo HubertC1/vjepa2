@@ -157,12 +157,13 @@ def calculate_smoothness_score(values):
     return 1.0 / (1.0 + jaggedness)
 
 
-def plot_distance_to_goal(vectors, goal_vector=None, save_path="distance_to_goal.png"):
+def plot_distance_to_goal(vectors, timestamps=None, goal_vector=None, save_path="distance_to_goal.png"):
     """
     Plots the L2 distance of a sequence of vectors to a goal vector.
 
     Args:
         vectors (torch.Tensor or np.ndarray): Sequence of latent vectors (T, D).
+        timestamps (list or np.ndarray, optional): Time values for x-axis.
         goal_vector (torch.Tensor or np.ndarray, optional): The goal state vector (D,).
                                                             If None, use the last vector in the sequence.
         save_path (str): Path to save the plot.
@@ -185,8 +186,14 @@ def plot_distance_to_goal(vectors, goal_vector=None, save_path="distance_to_goal
     smooth_score = calculate_smoothness_score(distances)
 
     plt.figure(figsize=(10, 6))
-    plt.plot(distances, marker="o", linestyle="-")
-    plt.xlabel("Time Step")
+    
+    if timestamps is not None:
+        plt.plot(timestamps, distances, marker="o", linestyle="-")
+        plt.xlabel("Time (seconds)")
+    else:
+        plt.plot(distances, marker="o", linestyle="-")
+        plt.xlabel("Time Step")
+        
     plt.ylabel("L2 Distance to Goal")
     title = (
         f"Distance to Goal State over Time\n"
@@ -218,18 +225,23 @@ def extract_video_vectors(
         device (str): Device to run inference on.
 
     Returns:
-        torch.Tensor: Sequence of state vectors (T, D).
+        tuple: (vectors, timestamps)
+            vectors (torch.Tensor): Sequence of state vectors (T, D).
+            timestamps (list): Time in seconds corresponding to each vector.
     """
     # Read video using torchvision
     # returns: video (Tensor[T, H, W, C]), audio, info
     # We load the full video first. For very long videos, this might be memory intensive.
-    video, _, _ = io.read_video(video_path, pts_unit="sec", output_format="TCHW")
+    video, _, info = io.read_video(video_path, pts_unit="sec", output_format="TCHW")
     # video is (T, C, H, W)
-
+    
+    fps = info.get("video_fps", 30.0) # Default to 30 if not found
+    
     total_frames = video.shape[0]
     vectors = []
+    timestamps = []
 
-    print(f"Extracting vectors from {video_path} (frames: {total_frames}, mode: {mode})")
+    print(f"Extracting vectors from {video_path} (frames: {total_frames}, fps: {fps:.2f}, mode: {mode})")
 
     indices = []
     if mode == "single_frame":
@@ -266,14 +278,16 @@ def extract_video_vectors(
             embedding = features.mean(dim=1).squeeze(0)  # (D,)
 
         vectors.append(embedding.cpu())
+        # Calculate timestamp for current index t
+        timestamps.append(t / fps)
 
         if i % 50 == 0:
             print(f"Processed {i}/{len(indices)}")
 
     if not vectors:
-        return torch.empty(0)
+        return torch.empty(0), []
 
-    return torch.stack(vectors)  # (T, D)
+    return torch.stack(vectors), timestamps
 
 
 def run_sample_inference():
@@ -355,7 +369,7 @@ def run_sample_inference():
     # Use PyTorch model and transform
     # Extract using single frame mode
     # Note: Processing all frames might take time.
-    vectors_single = extract_video_vectors(
+    vectors_single, timestamps_single = extract_video_vectors(
         model_pt,
         pt_video_transform,
         target_video_path,
@@ -363,10 +377,10 @@ def run_sample_inference():
         stride=2,
         device="cuda",
     )
-    plot_distance_to_goal(vectors_single, save_path="distance_single_frame.png")
+    plot_distance_to_goal(vectors_single, timestamps=timestamps_single, save_path="distance_single_frame.png")
 
     # Extract using clip mode
-    vectors_clip = extract_video_vectors(
+    vectors_clip, timestamps_clip = extract_video_vectors(
         model_pt,
         pt_video_transform,
         target_video_path,
@@ -375,7 +389,7 @@ def run_sample_inference():
         stride=2,  # Match tubelet_size (2) to avoid aliasing artifacts
         device="cuda",
     )
-    plot_distance_to_goal(vectors_clip, save_path="distance_clip.png")
+    plot_distance_to_goal(vectors_clip, timestamps=timestamps_clip, save_path="distance_clip.png")
 
 
 if __name__ == "__main__":
