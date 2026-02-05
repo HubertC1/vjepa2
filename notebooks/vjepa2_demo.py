@@ -19,6 +19,7 @@ from src.models.attentive_pooler import AttentiveClassifier
 from src.models.vision_transformer import vit_giant_xformers_rope
 
 import matplotlib.pyplot as plt
+from scipy.stats import spearmanr
 
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
@@ -115,6 +116,47 @@ def get_vjepa_video_classification_results(classifier, out_patch_features_pt):
     return
 
 
+def calculate_monotonicity_score(values):
+    """
+    Calculates the Spearman Rank Correlation between the indices and the values.
+    A score of -1.0 implies a perfect monotonic decrease (what we want for distance to goal).
+    A score of +1.0 implies a perfect monotonic increase.
+    A score of 0.0 implies no monotonic trend.
+    """
+    if len(values) < 2:
+        return 0.0
+    
+    indices = np.arange(len(values))
+    correlation, _ = spearmanr(indices, values)
+    return correlation
+
+
+def calculate_smoothness_score(values):
+    """
+    Calculates a smoothness score where higher is better (smoother).
+    
+    We first calculate 'jaggedness' as the mean absolute second difference.
+    Then we convert to a smoothness score in [0, 1]:
+        Smoothness = 1.0 / (1.0 + Jaggedness)
+    
+    A perfectly straight line has jaggedness 0 -> Smoothness 1.0.
+    Highly erratic curves have high jaggedness -> Smoothness approaches 0.0.
+    """
+    if len(values) < 3:
+        return 1.0
+
+    # First difference (velocity)
+    diffs = np.diff(values)
+    # Second difference (acceleration/change in slope)
+    second_diffs = np.diff(diffs)
+
+    # Jaggedness: mean magnitude of changes in slope
+    jaggedness = np.mean(np.abs(second_diffs))
+    
+    # Convert to smoothness (higher is better)
+    return 1.0 / (1.0 + jaggedness)
+
+
 def plot_distance_to_goal(vectors, goal_vector=None, save_path="distance_to_goal.png"):
     """
     Plots the L2 distance of a sequence of vectors to a goal vector.
@@ -138,14 +180,23 @@ def plot_distance_to_goal(vectors, goal_vector=None, save_path="distance_to_goal
     diff = vectors - goal_vector.unsqueeze(0)  # (T, D)
     distances = torch.norm(diff, p=2, dim=1).cpu().numpy()
 
+    # Calculate metrics
+    mono_score = calculate_monotonicity_score(distances)
+    smooth_score = calculate_smoothness_score(distances)
+
     plt.figure(figsize=(10, 6))
     plt.plot(distances, marker="o", linestyle="-")
     plt.xlabel("Time Step")
     plt.ylabel("L2 Distance to Goal")
-    plt.title("Distance to Goal State over Time")
+    title = (
+        f"Distance to Goal State over Time\n"
+        f"Monotonicity (Spearman): {mono_score:.4f} (Target: -1.0) | "
+        f"Smoothness: {smooth_score:.4f} (Target: 1.0)"
+    )
+    plt.title(title)
     plt.grid(True)
     plt.savefig(save_path)
-    print(f"Distance plot saved to {save_path}")
+    print(f"Distance plot saved to {save_path} | Monotonicity: {mono_score:.4f} | Smoothness: {smooth_score:.4f}")
     plt.close()
 
 
@@ -236,7 +287,7 @@ def run_sample_inference():
     # --- USER CONFIGURATION ---
     # Change this variable to choose another video path
     # target_video_path = "sample_video.mp4"
-    target_video_path = "/home/hubertchang/p-progress/vjepa2/episode_000000.mp4"
+    target_video_path = "/home/hubertchang/p-progress/vjepa2/videos/S4_Hotdog_C1_trim.mp4"
     # --------------------------
 
     # Download the video if not yet downloaded to local path
