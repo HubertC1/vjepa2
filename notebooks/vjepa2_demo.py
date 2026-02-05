@@ -7,6 +7,8 @@ import json
 import os
 import subprocess
 
+import datetime
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -452,20 +454,45 @@ def save_subgoal_videos(video_path, timestamps, goals, output_dir="subgoal_video
 
 
 def run_sample_inference():
-    # HuggingFace model repo name
-    hf_model_name = (
-        "facebook/vjepa2-vitg-fpc64-384"  # Replace with your favored model, e.g. facebook/vjepa2-vitg-fpc64-384
-    )
-    # Path to local PyTorch weights
-    pt_model_path = "/tmp2/hubertchang/p-progress/models/vitg-384.pt"
+    # --- CONFIGURATION ---
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = f"outputs/run_{timestamp}"
+    
+    config = {
+        "paths": {
+            "target_video_path": "/home/hubertchang/p-progress/vjepa2/videos/S4_Hotdog_C1_trim.mp4",
+            "pt_model_path": "/tmp2/hubertchang/p-progress/models/vitg-384.pt",
+            "hf_model_name": "facebook/vjepa2-vitg-fpc64-384",
+            "classifier_model_path": "/tmp2/hubertchang/p-progress/models/ssv2-vitg-384-64x2x3.pt",
+            "ssv2_classes_path": "ssv2_classes.json",
+            "output_dir": output_dir
+        },
+        "extraction": {
+            "single_frame_stride": 2,
+            "clip_tau": 16,
+            "clip_stride": 2,
+        },
+        "subgoal": {
+            "monotonicity_threshold": -0.6
+        }
+    }
+    
+    # Create output directory
+    os.makedirs(config["paths"]["output_dir"], exist_ok=True)
+    
+    # Save configuration
+    config_path = os.path.join(config["paths"]["output_dir"], "config.json")
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=4)
+    print(f"Configuration saved to {config_path}")
 
-    # --- USER CONFIGURATION ---
-    # Change this variable to choose another video path
-    # target_video_path = "sample_video.mp4"
-    target_video_path = "/home/hubertchang/p-progress/vjepa2/videos/S4_Hotdog_C1_trim.mp4"
-    # --------------------------
-
-    # Download the video if not yet downloaded to local path
+    # Access config variables
+    target_video_path = config["paths"]["target_video_path"]
+    hf_model_name = config["paths"]["hf_model_name"]
+    pt_model_path = config["paths"]["pt_model_path"]
+    classifier_model_path = config["paths"]["classifier_model_path"]
+    
+    # Download the video if not yet downloaded to local path (if using sample video)
     if target_video_path == "sample_video.mp4" and not os.path.exists(target_video_path):
         video_url = "https://huggingface.co/datasets/nateraw/kinetics-mini/resolve/main/val/bowling/-WH-lxmGJVY_000005_000015.mp4"
         command = ["wget", video_url, "-O", target_video_path]
@@ -504,21 +531,20 @@ def run_sample_inference():
     )
 
     # Initialize the classifier
-    classifier_model_path = "/tmp2/hubertchang/p-progress/models/ssv2-vitg-384-64x2x3.pt"
     classifier = (
         AttentiveClassifier(embed_dim=model_pt.embed_dim, num_heads=16, depth=4, num_classes=174).cuda().eval()
     )
     load_pretrained_vjepa_classifier_weights(classifier, classifier_model_path)
 
     # Download SSV2 classes if not already present
-    ssv2_classes_path = "ssv2_classes.json"
+    ssv2_classes_path = config["paths"]["ssv2_classes_path"]
     if not os.path.exists(ssv2_classes_path):
         command = [
             "wget",
             "https://huggingface.co/datasets/huggingface/label-files/resolve/d79675f2d50a7b1ecf98923d42c30526a51818e2/"
             "something-something-v2-id2label.json",
             "-O",
-            "ssv2_classes.json",
+            ssv2_classes_path,
         ]
         subprocess.run(command)
         print("Downloading SSV2 classes")
@@ -527,18 +553,21 @@ def run_sample_inference():
 
     # --- New Demo: Extract Vectors and Plot Progress ---
     print("\n--- Running Video Vector Extraction Demo ---")
-    # Use PyTorch model and transform
+    
     # Extract using single frame mode
-    # Note: Processing all frames might take time.
-    # vectors_single, timestamps_single = extract_video_vectors(
-    #     model_pt,
-    #     pt_video_transform,
-    #     target_video_path,
-    #     mode="single_frame",
-    #     stride=2,
-    #     device="cuda",
-    # )
-    # plot_distance_to_goal(vectors_single, timestamps=timestamps_single, save_path="distance_single_frame.png")
+    vectors_single, timestamps_single = extract_video_vectors(
+        model_pt,
+        pt_video_transform,
+        target_video_path,
+        mode="single_frame",
+        stride=config["extraction"]["single_frame_stride"],
+        device="cuda",
+    )
+    plot_distance_to_goal(
+        vectors_single, 
+        timestamps=timestamps_single, 
+        save_path=os.path.join(output_dir, "distance_single_frame.png")
+    )
 
     # Extract using clip mode
     vectors_clip, timestamps_clip = extract_video_vectors(
@@ -546,20 +575,36 @@ def run_sample_inference():
         pt_video_transform,
         target_video_path,
         mode="clip",
-        tau=16,
-        stride=2,  # Match tubelet_size (2) to avoid aliasing artifacts
+        tau=config["extraction"]["clip_tau"],
+        stride=config["extraction"]["clip_stride"],
         device="cuda",
     )
-    # plot_distance_to_goal(vectors_clip, timestamps=timestamps_clip, save_path="distance_clip.png")
+    plot_distance_to_goal(
+        vectors_clip, 
+        timestamps=timestamps_clip, 
+        save_path=os.path.join(output_dir, "distance_clip.png")
+    )
 
     # --- New Demo: Subgoal Discovery ---
     # We use the clip vectors as they are usually smoother/more robust
     print("\n--- Running Subgoal Discovery Demo ---")
-    goals, dynamic_dists = discover_subgoals(vectors_clip, timestamps_clip, threshold=-0.7)
-    plot_subgoal_discovery(timestamps_clip, dynamic_dists, goals, save_path="subgoal_discovery.png")
+    threshold = config["subgoal"]["monotonicity_threshold"]
+    goals, dynamic_dists = discover_subgoals(vectors_clip, timestamps_clip, threshold=threshold)
+    
+    plot_subgoal_discovery(
+        timestamps_clip, 
+        dynamic_dists, 
+        goals, 
+        save_path=os.path.join(output_dir, "subgoal_discovery.png")
+    )
 
     # Save video clips for discovered subgoals
-    save_subgoal_videos(target_video_path, timestamps_clip, goals)
+    save_subgoal_videos(
+        target_video_path, 
+        timestamps_clip, 
+        goals, 
+        output_dir=os.path.join(output_dir, "subgoal_videos")
+    )
 
 
 if __name__ == "__main__":
