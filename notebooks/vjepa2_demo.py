@@ -89,14 +89,14 @@ def get_video(video_path):
     return video
 
 
-def forward_vjepa_video(model_hf, model_pt, hf_transform, pt_transform, video_path):
+def forward_vjepa_video(model_hf, model_pt, hf_transform, pt_transform, video_path, device="cuda"):
     # Run a sample inference with VJEPA
     with torch.inference_mode():
         # Read and pre-process the image
         video = get_video(video_path)  # T x H x W x C
         video = torch.from_numpy(video).permute(0, 3, 1, 2)  # T x C x H x W
-        x_pt = pt_transform(video).cuda().unsqueeze(0)
-        x_hf = hf_transform(video, return_tensors="pt")["pixel_values_videos"].to("cuda")
+        x_pt = pt_transform(video).to(device).unsqueeze(0)
+        x_hf = hf_transform(video, return_tensors="pt")["pixel_values_videos"].to(device)
         # Extract the patch-wise features from the last layer
         out_patch_features_pt = model_pt(x_pt)
         out_patch_features_hf = model_hf.get_vision_features(x_hf)
@@ -304,7 +304,7 @@ def extract_video_vectors(
     return torch.stack(vectors), timestamps
 
 
-def discover_subgoals(vectors, timestamps, threshold=0.0):
+def discover_subgoals(vectors, timestamps, threshold=0.0, time_threshold=15):
     """
     Identifies subgoals by tracking distance monotonicity backwards from the end.
     
@@ -355,7 +355,7 @@ def discover_subgoals(vectors, timestamps, threshold=0.0):
 
         # Check if monotonicity is broken
         # We need a minimum segment size to trust the correlation (e.g. > 3 frames)
-        if len(dists) >= 4 and score > threshold:
+        if len(dists) >= time_threshold and score > threshold:
              # Violation! The curve is not monotonic enough.
              # Use current frame t as new goal.
              current_goal_idx = t
@@ -473,7 +473,8 @@ def run_sample_inference():
             "clip_stride": 2,
         },
         "subgoal": {
-            "monotonicity_threshold": -0.6
+            "monotonicity_threshold": -0.9,
+            "time_threshold": 15
         }
     }
     
@@ -492,6 +493,8 @@ def run_sample_inference():
     pt_model_path = config["paths"]["pt_model_path"]
     classifier_model_path = config["paths"]["classifier_model_path"]
     
+    device = "cuda:1"
+
     # Download the video if not yet downloaded to local path (if using sample video)
     if target_video_path == "sample_video.mp4" and not os.path.exists(target_video_path):
         video_url = "https://huggingface.co/datasets/nateraw/kinetics-mini/resolve/main/val/bowling/-WH-lxmGJVY_000005_000015.mp4"
@@ -501,7 +504,7 @@ def run_sample_inference():
 
     # Initialize the HuggingFace model, load pretrained weights
     model_hf = AutoModel.from_pretrained(hf_model_name)
-    model_hf.cuda().eval()
+    model_hf.to(device).eval()
 
     # Build HuggingFace preprocessing transform
     hf_transform = AutoVideoProcessor.from_pretrained(hf_model_name)
@@ -509,7 +512,7 @@ def run_sample_inference():
 
     # Initialize the PyTorch model, load pretrained weights
     model_pt = vit_giant_xformers_rope(img_size=(img_size, img_size), num_frames=64)
-    model_pt.cuda().eval()
+    model_pt.to(device).eval()
     load_pretrained_vjepa_pt_weights(model_pt, pt_model_path)
 
     # Build PyTorch preprocessing transform
@@ -517,7 +520,7 @@ def run_sample_inference():
 
     # Inference on video
     out_patch_features_hf, out_patch_features_pt = forward_vjepa_video(
-        model_hf, model_pt, hf_transform, pt_video_transform, target_video_path
+        model_hf, model_pt, hf_transform, pt_video_transform, target_video_path, device=device
     )
 
     print(
@@ -532,7 +535,7 @@ def run_sample_inference():
 
     # Initialize the classifier
     classifier = (
-        AttentiveClassifier(embed_dim=model_pt.embed_dim, num_heads=16, depth=4, num_classes=174).cuda().eval()
+        AttentiveClassifier(embed_dim=model_pt.embed_dim, num_heads=16, depth=4, num_classes=174).to(device).eval()
     )
     load_pretrained_vjepa_classifier_weights(classifier, classifier_model_path)
 
@@ -561,7 +564,7 @@ def run_sample_inference():
         target_video_path,
         mode="single_frame",
         stride=config["extraction"]["single_frame_stride"],
-        device="cuda",
+        device=device,
     )
     plot_distance_to_goal(
         vectors_single, 
@@ -577,7 +580,7 @@ def run_sample_inference():
         mode="clip",
         tau=config["extraction"]["clip_tau"],
         stride=config["extraction"]["clip_stride"],
-        device="cuda",
+        device=device,
     )
     plot_distance_to_goal(
         vectors_clip, 
@@ -589,7 +592,7 @@ def run_sample_inference():
     # We use the clip vectors as they are usually smoother/more robust
     print("\n--- Running Subgoal Discovery Demo ---")
     threshold = config["subgoal"]["monotonicity_threshold"]
-    goals, dynamic_dists = discover_subgoals(vectors_clip, timestamps_clip, threshold=threshold)
+    goals, dynamic_dists = discover_subgoals(vectors_clip, timestamps_clip, threshold=threshold, time_threshold=config["subgoal"]["time_threshold"])
     
     plot_subgoal_discovery(
         timestamps_clip, 
