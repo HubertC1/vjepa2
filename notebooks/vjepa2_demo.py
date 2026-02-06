@@ -7,16 +7,25 @@ import json
 import os
 import subprocess
 
+import datetime
+
 import numpy as np
 import torch
 import torch.nn.functional as F
-from decord import VideoReader
+import torchvision.io as io
 from transformers import AutoModel, AutoVideoProcessor
 
 import src.datasets.utils.video.transforms as video_transforms
 import src.datasets.utils.video.volume_transforms as volume_transforms
 from src.models.attentive_pooler import AttentiveClassifier
 from src.models.vision_transformer import vit_giant_xformers_rope
+
+import matplotlib.pyplot as plt
+from scipy.stats import spearmanr
+try:
+    from moviepy.editor import VideoFileClip
+except ImportError:
+    from moviepy import VideoFileClip
 
 IMAGENET_DEFAULT_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_DEFAULT_STD = (0.229, 0.224, 0.225)
@@ -55,22 +64,39 @@ def build_pt_video_transform(img_size):
     return eval_transform
 
 
-def get_video():
-    vr = VideoReader("sample_video.mp4")
+def get_video(video_path):
+    # Read video using torchvision
+    # returns: video (Tensor[T, H, W, C]), audio, info
+    video, _, _ = io.read_video(video_path, pts_unit="sec", output_format="TCHW")
+    
     # choosing some frames here, you can define more complex sampling strategy
+    # Ensure we don't go out of bounds if video is short
+    total_frames = video.shape[0]
     frame_idx = np.arange(0, 128, 2)
-    video = vr.get_batch(frame_idx).asnumpy()
+    if len(frame_idx) > 0 and frame_idx[-1] >= total_frames:
+        frame_idx = frame_idx[frame_idx < total_frames]
+
+    # Convert to numpy and rearrange to T, H, W, C for consistency with previous decord output if needed,
+    # BUT forward_vjepa_video expects T x C x H x W immediately after or handles it.
+    # Previous decord code:
+    # video = vr.get_batch(frame_idx).asnumpy() (T, H, W, C)
+    # Then forward_vjepa_video did: torch.from_numpy(video).permute(0, 3, 1, 2)
+    
+    # torchvision read_video with output_format="TCHW" gives (T, C, H, W).
+    # We will return it as T, H, W, C numpy array to minimize changes in forward_vjepa_video
+    
+    video = video[frame_idx].permute(0, 2, 3, 1).numpy()
     return video
 
 
-def forward_vjepa_video(model_hf, model_pt, hf_transform, pt_transform):
+def forward_vjepa_video(model_hf, model_pt, hf_transform, pt_transform, video_path, device="cuda"):
     # Run a sample inference with VJEPA
     with torch.inference_mode():
         # Read and pre-process the image
-        video = get_video()  # T x H x W x C
+        video = get_video(video_path)  # T x H x W x C
         video = torch.from_numpy(video).permute(0, 3, 1, 2)  # T x C x H x W
-        x_pt = pt_transform(video).cuda().unsqueeze(0)
-        x_hf = hf_transform(video, return_tensors="pt")["pixel_values_videos"].to("cuda")
+        x_pt = pt_transform(video).to(device).unsqueeze(0)
+        x_hf = hf_transform(video, return_tensors="pt")["pixel_values_videos"].to(device)
         # Extract the patch-wise features from the last layer
         out_patch_features_pt = model_pt(x_pt)
         out_patch_features_hf = model_hf.get_vision_features(x_hf)
@@ -96,25 +122,389 @@ def get_vjepa_video_classification_results(classifier, out_patch_features_pt):
     return
 
 
-def run_sample_inference():
-    # HuggingFace model repo name
-    hf_model_name = (
-        "facebook/vjepa2-vitg-fpc64-384"  # Replace with your favored model, e.g. facebook/vjepa2-vitg-fpc64-384
-    )
-    # Path to local PyTorch weights
-    pt_model_path = "YOUR_MODEL_PATH"
+def calculate_monotonicity_score(values):
+    """
+    Calculates the Spearman Rank Correlation between the indices and the values.
+    A score of -1.0 implies a perfect monotonic decrease (what we want for distance to goal).
+    A score of +1.0 implies a perfect monotonic increase.
+    A score of 0.0 implies no monotonic trend.
+    """
+    if len(values) < 2:
+        return 0.0
+    
+    indices = np.arange(len(values))
+    # Handle constant values (std=0) which cause spearmanr to return NaN
+    if np.all(values == values[0]):
+        return 0.0 # No trend
+        
+    correlation, _ = spearmanr(indices, values)
+    
+    if np.isnan(correlation):
+        return 0.0
+        
+    return correlation
 
-    sample_video_path = "sample_video.mp4"
-    # Download the video if not yet downloaded to local path
-    if not os.path.exists(sample_video_path):
+
+def calculate_smoothness_score(values):
+    """
+    Calculates a smoothness score where higher is better (smoother).
+    
+    We first calculate 'jaggedness' as the mean absolute second difference.
+    Then we convert to a smoothness score in [0, 1]:
+        Smoothness = 1.0 / (1.0 + Jaggedness)
+    
+    A perfectly straight line has jaggedness 0 -> Smoothness 1.0.
+    Highly erratic curves have high jaggedness -> Smoothness approaches 0.0.
+    """
+    if len(values) < 3:
+        return 1.0
+
+    # First difference (velocity)
+    diffs = np.diff(values)
+    # Second difference (acceleration/change in slope)
+    second_diffs = np.diff(diffs)
+
+    # Jaggedness: mean magnitude of changes in slope
+    jaggedness = np.mean(np.abs(second_diffs))
+    
+    # Convert to smoothness (higher is better)
+    return 1.0 / (1.0 + jaggedness)
+
+
+def plot_distance_to_goal(vectors, timestamps=None, goal_vector=None, save_path="distance_to_goal.png"):
+    """
+    Plots the L2 distance of a sequence of vectors to a goal vector.
+
+    Args:
+        vectors (torch.Tensor or np.ndarray): Sequence of latent vectors (T, D).
+        timestamps (list or np.ndarray, optional): Time values for x-axis.
+        goal_vector (torch.Tensor or np.ndarray, optional): The goal state vector (D,).
+                                                            If None, use the last vector in the sequence.
+        save_path (str): Path to save the plot.
+    """
+    if isinstance(vectors, np.ndarray):
+        vectors = torch.from_numpy(vectors)
+    if goal_vector is not None and isinstance(goal_vector, np.ndarray):
+        goal_vector = torch.from_numpy(goal_vector)
+
+    if goal_vector is None:
+        goal_vector = vectors[-1]
+
+    # Calculate L2 distances
+    # vectors: (T, D), goal_vector: (D,)
+    diff = vectors - goal_vector.unsqueeze(0)  # (T, D)
+    distances = torch.norm(diff, p=2, dim=1).cpu().numpy()
+
+    # Calculate metrics
+    mono_score = calculate_monotonicity_score(distances)
+    smooth_score = calculate_smoothness_score(distances)
+
+    plt.figure(figsize=(10, 6))
+    
+    if timestamps is not None:
+        plt.plot(timestamps, distances, marker="o", linestyle="-")
+        plt.xlabel("Time (seconds)")
+    else:
+        plt.plot(distances, marker="o", linestyle="-")
+        plt.xlabel("Time Step")
+        
+    plt.ylabel("L2 Distance to Goal")
+    title = (
+        f"Distance to Goal State over Time\n"
+        f"Monotonicity (Spearman): {mono_score:.4f} (Target: -1.0) | "
+        f"Smoothness: {smooth_score:.4f} (Target: 1.0)"
+    )
+    plt.title(title)
+    plt.grid(True)
+    plt.savefig(save_path)
+    print(f"Distance plot saved to {save_path} | Monotonicity: {mono_score:.4f} | Smoothness: {smooth_score:.4f}")
+    plt.close()
+
+
+def extract_video_vectors(
+    model, transform, video_path, mode="single_frame", tau=16, stride=1, device="cuda"
+):
+    """
+    Extracts latent vectors from a video using the VJEPA model.
+
+    Args:
+        model (torch.nn.Module): The VJEPA model.
+        transform (callable): Video transform function.
+        video_path (str): Path to the video file.
+        mode (str): 'single_frame' or 'clip'.
+                    'single_frame': Encodes each frame as a state (duplicating to meet model input reqs).
+                    'clip': Encodes a clip of length tau ending at t as the state at t.
+        tau (int): Window size for 'clip' mode.
+        stride (int): Stride for sampling frames.
+        device (str): Device to run inference on.
+
+    Returns:
+        tuple: (vectors, timestamps)
+            vectors (torch.Tensor): Sequence of state vectors (T, D).
+            timestamps (list): Time in seconds corresponding to each vector.
+    """
+    # Read video using torchvision
+    # returns: video (Tensor[T, H, W, C]), audio, info
+    # We load the full video first. For very long videos, this might be memory intensive.
+    video, _, info = io.read_video(video_path, pts_unit="sec", output_format="TCHW")
+    # video is (T, C, H, W)
+    
+    fps = info.get("video_fps", 30.0) # Default to 30 if not found
+    
+    total_frames = video.shape[0]
+    vectors = []
+    timestamps = []
+
+    print(f"Extracting vectors from {video_path} (frames: {total_frames}, fps: {fps:.2f}, mode: {mode})")
+
+    indices = []
+    if mode == "single_frame":
+        indices = range(0, total_frames, stride)
+    elif mode == "clip":
+        # Start from tau so we have a full clip [t-tau, t)
+        indices = range(tau, total_frames + 1, stride)
+
+    for i, t in enumerate(indices):
+        if mode == "single_frame":
+            # Extract single frame
+            # frame is (C, H, W) -> need (H, W, C) for transform compatibility
+            frame = video[t].permute(1, 2, 0).numpy() 
+            # Duplicate to satisfy temporal dimension if needed (e.g. tubelet_size=2)
+            clip = [frame, frame]
+        elif mode == "clip":
+            # Extract clip [t-tau, t)
+            # clip_indices = range(t - tau, t)
+            # video[start:end] works
+            clip_tensor = video[t - tau : t] # (tau, C, H, W)
+            # Convert to list of numpy arrays (H, W, C)
+            clip = [c.permute(1, 2, 0).numpy() for c in clip_tensor]
+
+        # Transform
+        # Transform expects list of numpy arrays (H, W, C)
+        # Returns (C, T, H, W) tensor
+        x = transform(clip)
+        x = x.unsqueeze(0).to(device)  # (1, C, T, H, W)
+
+        with torch.inference_mode():
+            # Model output: (1, N_patches, D)
+            features = model(x)
+            # Average pool patches to get single state vector
+            embedding = features.mean(dim=1).squeeze(0)  # (D,)
+
+        vectors.append(embedding.cpu())
+        # Calculate timestamp for current index t
+        timestamps.append(t / fps)
+
+        if i % 50 == 0:
+            print(f"Processed {i}/{len(indices)}")
+
+    if not vectors:
+        return torch.empty(0), []
+
+    return torch.stack(vectors), timestamps
+
+
+def discover_subgoals(vectors, timestamps, threshold=0.0, time_threshold=15):
+    """
+    Identifies subgoals by tracking distance monotonicity backwards from the end.
+    
+    Args:
+        vectors (torch.Tensor): Sequence of latent vectors (T, D).
+        timestamps (list): Time values.
+        threshold (float): Monotonicity score threshold. If score > threshold, trigger subgoal.
+                           Score is Spearman correlation (-1 to 1). 
+                           -1 is perfect decreasing distance (good).
+                           Higher values imply non-decreasing or increasing distance (bad).
+                           
+    Returns:
+        tuple: (goals, dynamic_distances)
+            goals (list): Indices of discovered subgoals (sorted ascending).
+            dynamic_distances (np.ndarray): Distance of each frame to its assigned future goal.
+    """
+    T = len(vectors)
+    if T == 0:
+        return [], np.array([])
+
+    # Indices of identified goals. Start with the last frame.
+    goals = [T - 1]
+    
+    # Array to store the "Distance to Current Goal" for each frame
+    dynamic_distances = np.zeros(T)
+    
+    # Current active goal index (initially the last frame)
+    current_goal_idx = T - 1
+    
+    print(f"Discovering subgoals (Backwards, Threshold={threshold})...")
+    
+    # Iterate backwards from the frame before the last one
+    for t in range(T - 2, -1, -1):
+        # Current segment: [t, ..., current_goal_idx]
+        segment_vectors = vectors[t : current_goal_idx + 1]
+        target_goal = vectors[current_goal_idx]
+        
+        # Calculate distances for this segment to the target goal
+        diff = segment_vectors - target_goal.unsqueeze(0)
+        dists = torch.norm(diff, p=2, dim=1).cpu().numpy()
+        
+        # Calculate monotonicity
+        # We want distances to decrease as time index increases (t -> goal)
+        score = calculate_monotonicity_score(dists)
+        
+        # Store distance for current frame t
+        dynamic_distances[t] = dists[0]
+
+        # Check if monotonicity is broken
+        # We need a minimum segment size to trust the correlation (e.g. > 3 frames)
+        if len(dists) >= time_threshold and score > threshold:
+             # Violation! The curve is not monotonic enough.
+             # Use current frame t as new goal.
+             current_goal_idx = t
+             goals.append(t)
+             
+             # Reset distance for t to 0 (since it's now the goal)
+             dynamic_distances[t] = 0.0
+             
+             # Debug print (optional, can be noisy)
+             # print(f"  New subgoal found at t={t} ({timestamps[t]:.2f}s) | Score: {score:.3f}")
+             
+    # Ensure goals are sorted (they are appended in reverse order)
+    goals = sorted(goals)
+    
+    # Handle end case
+    dynamic_distances[T-1] = 0.0
+    
+    return goals, dynamic_distances
+
+
+def plot_subgoal_discovery(timestamps, distances, goals, save_path="subgoal_discovery.png"):
+    plt.figure(figsize=(12, 6))
+    plt.plot(timestamps, distances, label="Distance to Dynamic Goal", linewidth=1.5)
+    
+    # Plot goal markers
+    goal_times = [timestamps[g] for g in goals]
+    goal_dists = [distances[g] for g in goals] 
+    plt.scatter(goal_times, goal_dists, c='red', marker='x', s=100, label="Discovered Subgoals", zorder=5)
+    
+    for gt in goal_times:
+        plt.axvline(x=gt, color='r', linestyle='--', alpha=0.3)
+
+    plt.xlabel("Time (s)")
+    plt.ylabel("L2 Distance to Current Subgoal")
+    plt.title(f"Unsupervised Subgoal Discovery\n(Backwards Monotonicity Tracking) | Found {len(goals)} goals")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(save_path)
+    print(f"Subgoal plot saved to {save_path} | Found {len(goals)} subgoals")
+    plt.close()
+
+
+def save_subgoal_videos(video_path, timestamps, goals, output_dir="subgoal_videos"):
+    """
+    Saves video clips for each discovered subgoal segment.
+
+    Args:
+        video_path (str): Path to original video.
+        timestamps (list): Timestamps for each frame/vector index.
+        goals (list): Indices of discovered subgoals (sorted ascending).
+        output_dir (str): Directory to save clips.
+    """
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    print(f"Saving {len(goals)} subgoal clips to {output_dir}/ ...")
+    
+    try:
+        clip = VideoFileClip(video_path)
+        
+        # Determine start time of video analysis
+        # If we started at t=0, start_time is 0. If we had an offset (e.g. clip mode tau), 
+        # timestamps[0] handles that.
+        start_time = 0.0
+        
+        for i, goal_idx in enumerate(goals):
+            end_time = timestamps[goal_idx]
+            
+            # Clip end_time to video duration to avoid errors
+            if end_time > clip.duration:
+                print(f"  Adjusting end time from {end_time:.2f}s to video duration {clip.duration:.2f}s")
+                end_time = clip.duration
+            
+            # Ensure valid clip duration
+            if end_time > start_time:
+                # MoviePy 2.x uses .subclipped() instead of .subclip()
+                if hasattr(clip, "subclipped"):
+                    subclip = clip.subclipped(start_time, end_time)
+                else:
+                    subclip = clip.subclip(start_time, end_time)
+                
+                output_filename = os.path.join(output_dir, f"subgoal_{i+1:02d}.mp4")
+                subclip.write_videofile(output_filename, codec="libx264", audio_codec="aac")
+                print(f"  Saved {output_filename} ({start_time:.2f}s -> {end_time:.2f}s)")
+            else:
+                print(f"  Skipping subgoal {i+1}: duration too short ({start_time:.2f}s -> {end_time:.2f}s)")
+            
+            # Next clip starts where this one ended
+            start_time = end_time
+            
+        clip.close()
+        print("All clips saved.")
+
+    except Exception as e:
+        print(f"Error saving video clips: {e}")
+
+
+def run_sample_inference():
+    # --- CONFIGURATION ---
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = f"outputs/run_{timestamp}"
+    
+    config = {
+        "paths": {
+            "target_video_path": "/home/hubertchang/p-progress/vjepa2/videos/S4_Hotdog_C1_trim.mp4",
+            "pt_model_path": "/tmp2/hubertchang/p-progress/models/vitg-384.pt",
+            "hf_model_name": "facebook/vjepa2-vitg-fpc64-384",
+            "classifier_model_path": "/tmp2/hubertchang/p-progress/models/ssv2-vitg-384-64x2x3.pt",
+            "ssv2_classes_path": "ssv2_classes.json",
+            "output_dir": output_dir
+        },
+        "extraction": {
+            "single_frame_stride": 2,
+            "clip_tau": 16,
+            "clip_stride": 2,
+        },
+        "subgoal": {
+            "monotonicity_threshold": -0.9,
+            "time_threshold": 15
+        }
+    }
+    
+    # Create output directory
+    os.makedirs(config["paths"]["output_dir"], exist_ok=True)
+    
+    # Save configuration
+    config_path = os.path.join(config["paths"]["output_dir"], "config.json")
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=4)
+    print(f"Configuration saved to {config_path}")
+
+    # Access config variables
+    target_video_path = config["paths"]["target_video_path"]
+    hf_model_name = config["paths"]["hf_model_name"]
+    pt_model_path = config["paths"]["pt_model_path"]
+    classifier_model_path = config["paths"]["classifier_model_path"]
+    
+    device = "cuda:1"
+
+    # Download the video if not yet downloaded to local path (if using sample video)
+    if target_video_path == "sample_video.mp4" and not os.path.exists(target_video_path):
         video_url = "https://huggingface.co/datasets/nateraw/kinetics-mini/resolve/main/val/bowling/-WH-lxmGJVY_000005_000015.mp4"
-        command = ["wget", video_url, "-O", sample_video_path]
+        command = ["wget", video_url, "-O", target_video_path]
         subprocess.run(command)
         print("Downloading video")
 
     # Initialize the HuggingFace model, load pretrained weights
     model_hf = AutoModel.from_pretrained(hf_model_name)
-    model_hf.cuda().eval()
+    model_hf.to(device).eval()
 
     # Build HuggingFace preprocessing transform
     hf_transform = AutoVideoProcessor.from_pretrained(hf_model_name)
@@ -122,7 +512,7 @@ def run_sample_inference():
 
     # Initialize the PyTorch model, load pretrained weights
     model_pt = vit_giant_xformers_rope(img_size=(img_size, img_size), num_frames=64)
-    model_pt.cuda().eval()
+    model_pt.to(device).eval()
     load_pretrained_vjepa_pt_weights(model_pt, pt_model_path)
 
     # Build PyTorch preprocessing transform
@@ -130,7 +520,7 @@ def run_sample_inference():
 
     # Inference on video
     out_patch_features_hf, out_patch_features_pt = forward_vjepa_video(
-        model_hf, model_pt, hf_transform, pt_video_transform
+        model_hf, model_pt, hf_transform, pt_video_transform, target_video_path, device=device
     )
 
     print(
@@ -144,26 +534,80 @@ def run_sample_inference():
     )
 
     # Initialize the classifier
-    classifier_model_path = "YOUR_ATTENTIVE_PROBE_PATH"
     classifier = (
-        AttentiveClassifier(embed_dim=model_pt.embed_dim, num_heads=16, depth=4, num_classes=174).cuda().eval()
+        AttentiveClassifier(embed_dim=model_pt.embed_dim, num_heads=16, depth=4, num_classes=174).to(device).eval()
     )
     load_pretrained_vjepa_classifier_weights(classifier, classifier_model_path)
 
     # Download SSV2 classes if not already present
-    ssv2_classes_path = "ssv2_classes.json"
+    ssv2_classes_path = config["paths"]["ssv2_classes_path"]
     if not os.path.exists(ssv2_classes_path):
         command = [
             "wget",
             "https://huggingface.co/datasets/huggingface/label-files/resolve/d79675f2d50a7b1ecf98923d42c30526a51818e2/"
             "something-something-v2-id2label.json",
             "-O",
-            "ssv2_classes.json",
+            ssv2_classes_path,
         ]
         subprocess.run(command)
         print("Downloading SSV2 classes")
 
     get_vjepa_video_classification_results(classifier, out_patch_features_pt)
+
+    # --- New Demo: Extract Vectors and Plot Progress ---
+    print("\n--- Running Video Vector Extraction Demo ---")
+    
+    # Extract using single frame mode
+    vectors_single, timestamps_single = extract_video_vectors(
+        model_pt,
+        pt_video_transform,
+        target_video_path,
+        mode="single_frame",
+        stride=config["extraction"]["single_frame_stride"],
+        device=device,
+    )
+    plot_distance_to_goal(
+        vectors_single, 
+        timestamps=timestamps_single, 
+        save_path=os.path.join(output_dir, "distance_single_frame.png")
+    )
+
+    # Extract using clip mode
+    vectors_clip, timestamps_clip = extract_video_vectors(
+        model_pt,
+        pt_video_transform,
+        target_video_path,
+        mode="clip",
+        tau=config["extraction"]["clip_tau"],
+        stride=config["extraction"]["clip_stride"],
+        device=device,
+    )
+    plot_distance_to_goal(
+        vectors_clip, 
+        timestamps=timestamps_clip, 
+        save_path=os.path.join(output_dir, "distance_clip.png")
+    )
+
+    # --- New Demo: Subgoal Discovery ---
+    # We use the clip vectors as they are usually smoother/more robust
+    print("\n--- Running Subgoal Discovery Demo ---")
+    threshold = config["subgoal"]["monotonicity_threshold"]
+    goals, dynamic_dists = discover_subgoals(vectors_clip, timestamps_clip, threshold=threshold, time_threshold=config["subgoal"]["time_threshold"])
+    
+    plot_subgoal_discovery(
+        timestamps_clip, 
+        dynamic_dists, 
+        goals, 
+        save_path=os.path.join(output_dir, "subgoal_discovery.png")
+    )
+
+    # Save video clips for discovered subgoals
+    save_subgoal_videos(
+        target_video_path, 
+        timestamps_clip, 
+        goals, 
+        output_dir=os.path.join(output_dir, "subgoal_videos")
+    )
 
 
 if __name__ == "__main__":
