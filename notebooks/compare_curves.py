@@ -321,6 +321,101 @@ def save_subgoal_videos(video_path, goals_time, output_dir):
     except Exception as e:
         print(f"Error saving video clips: {e}")
 
+def create_subgoal_discovery_gif(frames, timestamps, distances, goals_time, output_path, fps=30, title_suffix="", distance_metric='l2', monotonicity_threshold=None):
+    print(f"Creating subgoal discovery GIF at {output_path}...")
+    
+    fig, ax = plt.subplots(nrows=1, ncols=2, figsize=(14, 6))
+    
+    # Setup static parts
+    ax[1].set_title("Input Video", fontsize=15)
+    ax[1].set_xticks([])
+    ax[1].set_yticks([])
+    
+    title = f"Subgoal Discovery {title_suffix}"
+    if monotonicity_threshold is not None:
+        title += f"\nMono. Metric: Spearman | Thresh: {monotonicity_threshold}"
+    
+    ax[0].set_title(title, fontsize=15)
+    ax[0].set_xlabel("Time (s)", fontsize=15)
+    ax[0].set_ylabel(f"{distance_metric.upper()} Distance to Current Subgoal", fontsize=15)
+    
+    # Determine max time for x-axis
+    max_time = timestamps[-1] if len(timestamps) > 0 else 1.0
+    ax[0].set_xlim(0, max_time)
+    
+    # Determine y-axis limits
+    max_dist = np.max(distances) if len(distances) > 0 else 1.0
+    ax[0].set_ylim(0, max_dist * 1.1)
+
+    def animate(i):
+        # i is the current frame index of the video
+        if i >= len(frames):
+            return ax
+            
+        for ax_subplot in ax:
+            ax_subplot.clear()
+            
+        # 1. Plot curve up to current time
+        # We need to map video frame index i to our timestamps
+        # Assuming timestamps are roughly aligned with video frames
+        # If extraction stride > 1, we need to be careful.
+        # Let's find the timestamp closest to current frame time
+        current_time = i / fps
+        
+        # Plot full curve up to current time
+        valid_mask = np.array(timestamps) <= current_time
+        if np.any(valid_mask):
+            curr_timestamps = np.array(timestamps)[valid_mask]
+            curr_dists = distances[valid_mask]
+            ax[0].plot(curr_timestamps, curr_dists, label="Distance", linewidth=2)
+            
+            # Plot discovered goals that have been passed
+            passed_goals = [g for g in goals_time if g <= current_time]
+            
+            # Find distances for passed goals
+            passed_goal_dists = []
+            for g in passed_goals:
+                # Find closest timestamp index
+                idx = np.argmin(np.abs(np.array(timestamps) - g))
+                passed_goal_dists.append(distances[idx])
+                
+            if passed_goals:
+                ax[0].scatter(passed_goals, passed_goal_dists, c='red', marker='x', s=100, label="Subgoals", zorder=5)
+                for gt in passed_goals:
+                    ax[0].axvline(x=gt, color='r', linestyle='--', alpha=0.3)
+        
+        ax[0].set_title(title, fontsize=15)
+        ax[0].legend(loc="upper right")
+        ax[0].set_xlabel("Time (s)", fontsize=15)
+        ax[0].set_ylabel(f"{distance_metric.upper()} Distance to Current Subgoal", fontsize=15)
+        ax[0].set_xlim(0, max_time)
+        ax[0].set_ylim(0, max_dist * 1.1)
+
+        # 2. Plot video frame
+        ax[1].imshow(frames[i])
+        ax[1].set_xticks([])
+        ax[1].set_yticks([])
+        ax[1].set_title(f"Input Video (Frame {i})", fontsize=15)
+
+        return ax
+
+    # Create animation frames with pauses at subgoals
+    animation_frames = []
+    pause_frames_count = int(fps * 1.0) # 1 second pause
+    
+    # Convert goal times back to frame indices
+    goal_indices = set([int(np.round(t * fps)) for t in goals_time])
+    
+    for i in range(len(frames)):
+        animation_frames.append(i)
+        if i in goal_indices:
+            animation_frames.extend([i] * pause_frames_count)
+
+    ani = FuncAnimation(fig, animate, interval=1000/fps, repeat=False, frames=animation_frames)
+    ani.save(output_path, dpi=100, writer=PillowWriter(fps=fps))
+    plt.close()
+    print("Subgoal GIF saved.")
+
 def create_comparison_gif(frames, results, output_path, fps=30, distance_metric='l2'):
     # results: dict {name: (embeddings, indices)}
     
@@ -411,13 +506,14 @@ def run_comparison():
         "device": "cuda:0",
         # "video_path": "/home/hubertchang/p-progress/vjepa2/videos/S4_Hotdog_C1_trim.mp4",
         # "video_path": "/home/hubertchang/p-progress/vjepa2/videos/fold.mp4",
-        "video_path": "/home/hubertchang/p-progress/vjepa2/notebooks/droid_samples/episode_005/exterior_image_2_left.mp4",
+        # "video_path": "/home/hubertchang/p-progress/vjepa2/notebooks/droid_samples/episode_007/exterior_image_2_left.mp4",
+        "video_path": "/home/hubertchang/p-progress/vjepa2/notebooks/droid_samples/episode_028/exterior_image_1_left.mp4",
         # "video_path": "/home/hubertchang/p-progress/vip/vip/examples/demo_hotdog/subgoal_09.mp4",
         "pt_model_path": "/tmp2/hubertchang/p-progress/models/vitg-384.pt",
         "output_dir": output_dir,
         "distance_metric": "l1", # 'l1' or 'l2'
         "subgoal": {
-            "monotonicity_threshold": -0.9,
+            "monotonicity_thresholds": [-0.85, -0.9, -0.92, -0.95],
             "time_threshold": 15
         },
         "configs": {
@@ -430,21 +526,21 @@ def run_comparison():
                 "tau": 1,
                 "stride": 1
             },
-            "VJEPA_Clip_2": {
-                "type": "vjepa",
-                "tau": 2,
-                "stride": 1
-            },
+            # "VJEPA_Clip_2": {
+            #     "type": "vjepa",
+            #     "tau": 2,
+            #     "stride": 2
+            # },
             "VJEPA_Clip_8": {
                 "type": "vjepa",
                 "tau": 8,
-                "stride": 1
+                "stride": 2
             },
-            "VJEPA_Clip_16": {
-                "type": "vjepa",
-                "tau": 16,
-                "stride": 1
-            }
+            # "VJEPA_Clip_16": {
+            #     "type": "vjepa",
+            #     "tau": 16,
+            #     "stride": 2
+            # }
         }
     }
     
@@ -491,29 +587,49 @@ def run_comparison():
         results[name] = (embs, indices)
         
         # Subgoal Discovery & Saving
-        sub_dir = os.path.join(output_dir, name)
-        os.makedirs(sub_dir, exist_ok=True)
-        
         # Convert indices to timestamps for plotting/saving
         timestamps = [i / fps for i in indices]
         
-        goals_abs, dynamic_dists = discover_subgoals(
-            embs, indices, 
-            threshold=config["subgoal"]["monotonicity_threshold"], 
-            time_threshold=config["subgoal"]["time_threshold"],
-            distance_metric=config.get("distance_metric", "l2")
-        )
-        
-        goals_time = [g / fps for g in goals_abs]
-        
-        plot_subgoal_discovery(
-            timestamps, dynamic_dists, goals_time, 
-            save_path=os.path.join(sub_dir, "subgoal_discovery.png"),
-            title_suffix=f"({name})",
-            distance_metric=config.get("distance_metric", "l2")
-        )
-        
-        save_subgoal_videos(video_path, goals_time, output_dir=os.path.join(sub_dir, "clips"))
+        thresholds = config["subgoal"].get("monotonicity_thresholds", [])
+        # Support legacy single threshold key if list not present
+        if not thresholds and "monotonicity_threshold" in config["subgoal"]:
+            thresholds = [config["subgoal"]["monotonicity_threshold"]]
+            
+        if not isinstance(thresholds, list):
+            thresholds = [thresholds]
+            
+        for threshold in thresholds:
+            print(f"  > Running subgoal discovery with threshold={threshold}...")
+            # Create subdirectory for this threshold
+            sub_dir = os.path.join(output_dir, name, f"thresh_{threshold}")
+            os.makedirs(sub_dir, exist_ok=True)
+            
+            goals_abs, dynamic_dists = discover_subgoals(
+                embs, indices, 
+                threshold=threshold, 
+                time_threshold=config["subgoal"]["time_threshold"],
+                distance_metric=config.get("distance_metric", "l2")
+            )
+            
+            goals_time = [g / fps for g in goals_abs]
+            
+            plot_subgoal_discovery(
+                timestamps, dynamic_dists, goals_time, 
+                save_path=os.path.join(sub_dir, "subgoal_discovery.png"),
+                title_suffix=f"({name})",
+                distance_metric=config.get("distance_metric", "l2")
+            )
+            
+            create_subgoal_discovery_gif(
+                frames, timestamps, dynamic_dists, goals_time,
+                output_path=os.path.join(sub_dir, "subgoal_discovery.gif"),
+                fps=fps,
+                title_suffix=f"({name})",
+                distance_metric=config.get("distance_metric", "l2"),
+                monotonicity_threshold=threshold
+            )
+            
+            save_subgoal_videos(video_path, goals_time, output_dir=os.path.join(sub_dir, "clips"))
         
     # Create Comparison GIF
     create_comparison_gif(
