@@ -364,7 +364,7 @@ def save_subgoal_videos(video_path, goals_time, output_dir):
     except Exception as e:
         print(f"Error saving video clips: {e}")
 
-def create_subgoal_discovery_gif(frames, timestamps, distances, goals_time, output_path, fps=30, title_suffix="", distance_metric='l2', monotonicity_threshold=None):
+def create_subgoal_discovery_gif(frames, timestamps, distances, goals_time, output_path, fps=30, title_suffix="", distance_metric='l2', monotonicity_threshold=None, smoothing_bandwidth=None, play_backward=False):
     print(f"Creating subgoal discovery GIF at {output_path}...")
     
     fig, ax = plt.subplots(nrows=1, ncols=2, figsize=(14, 6))
@@ -377,6 +377,8 @@ def create_subgoal_discovery_gif(frames, timestamps, distances, goals_time, outp
     title = f"Subgoal Discovery {title_suffix}"
     if monotonicity_threshold is not None:
         title += f"\nMono. Metric: Spearman | Thresh: {monotonicity_threshold}"
+    if smoothing_bandwidth is not None:
+        title += f"\nSmoothing BW: {smoothing_bandwidth}"
     
     ax[0].set_title(title, fontsize=15)
     ax[0].set_xlabel("Time (s)", fontsize=15)
@@ -449,7 +451,13 @@ def create_subgoal_discovery_gif(frames, timestamps, distances, goals_time, outp
     # Convert goal times back to frame indices
     goal_indices = set([int(np.round(t * fps)) for t in goals_time])
     
-    for i in range(len(frames)):
+    # Determine base playback order (forward or backward)
+    if play_backward:
+        base_sequence = range(len(frames) - 1, -1, -1)
+    else:
+        base_sequence = range(len(frames))
+    
+    for i in base_sequence:
         animation_frames.append(i)
         if i in goal_indices:
             animation_frames.extend([i] * pause_frames_count)
@@ -671,7 +679,21 @@ def run_comparison():
                 fps=fps,
                 title_suffix=f"({name})",
                 distance_metric=config.get("distance_metric", "l2"),
-                monotonicity_threshold=threshold
+                monotonicity_threshold=threshold,
+                smoothing_bandwidth=config["subgoal"].get("smoothing_bandwidth", None),
+                play_backward=False
+            )
+            
+            # Backward playback GIF for subgoal discovery
+            create_subgoal_discovery_gif(
+                frames, timestamps, dynamic_dists, goals_time,
+                output_path=os.path.join(sub_dir, "subgoal_discovery_backward.gif"),
+                fps=fps,
+                title_suffix=f"({name}, Backward Playback)",
+                distance_metric=config.get("distance_metric", "l2"),
+                monotonicity_threshold=threshold,
+                smoothing_bandwidth=config["subgoal"].get("smoothing_bandwidth", None),
+                play_backward=True
             )
             
             save_subgoal_videos(video_path, goals_time, output_dir=os.path.join(sub_dir, "clips"))
