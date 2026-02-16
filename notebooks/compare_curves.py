@@ -213,7 +213,33 @@ def calculate_monotonicity_score(values):
         return 0.0
     return correlation
 
-def discover_subgoals(vectors, indices, threshold=0.0, time_threshold=15, distance_metric='l2'):
+def kernel_regression_smoothing(x, y, bandwidth):
+    """
+    Nadaraya-Watson kernel regression with Gaussian kernel.
+    x: normalized time coordinates (0 to 1)
+    y: signal to smooth
+    bandwidth: sigma for the Gaussian kernel
+    """
+    if len(x) < 2:
+        return y
+        
+    # x and y are numpy arrays of shape (N,)
+    x_col = x[:, np.newaxis] # (N, 1)
+    dist_sq = (x_col - x_col.T) ** 2 # (N, N)
+    
+    # Compute weights: w_ij = exp(-dist_sq / (2 * h^2))
+    weights = np.exp(-dist_sq / (2 * bandwidth**2)) # (N, N)
+    
+    # Normalize weights rows to sum to 1
+    sum_weights = np.sum(weights, axis=1)
+    # Avoid division by zero
+    sum_weights[sum_weights < 1e-10] = 1.0
+    
+    y_smooth = (weights @ y) / sum_weights
+    
+    return y_smooth
+
+def discover_subgoals(vectors, indices, timestamps, threshold=0.0, time_threshold=15, distance_metric='l2', smoothing_bandwidth=None):
     if len(vectors) == 0:
         return [], np.array([])
         
@@ -225,7 +251,17 @@ def discover_subgoals(vectors, indices, threshold=0.0, time_threshold=15, distan
     dynamic_distances = np.zeros(T)
     current_goal_idx = T - 1
     
-    print(f"Discovering subgoals (Backwards, Threshold={threshold}, Metric={distance_metric})...")
+    # Normalize timestamps for smoothing if needed
+    ts_norm = None
+    if smoothing_bandwidth is not None and len(timestamps) > 1:
+        ts_arr = np.array(timestamps)
+        duration = ts_arr[-1] - ts_arr[0]
+        if duration > 1e-6:
+            ts_norm = (ts_arr - ts_arr[0]) / duration
+        else:
+            ts_norm = np.zeros_like(ts_arr)
+    
+    print(f"Discovering subgoals (Backwards, Threshold={threshold}, Metric={distance_metric}, Smoothing={smoothing_bandwidth})...")
     
     for t in range(T - 2, -1, -1):
         segment_vectors = vectors_tensor[t : current_goal_idx + 1]
@@ -236,6 +272,13 @@ def discover_subgoals(vectors, indices, threshold=0.0, time_threshold=15, distan
             dists = torch.norm(diff, p=1, dim=1).numpy()
         else:
             dists = torch.norm(diff, p=2, dim=1).numpy()
+            
+        # Apply smoothing if requested
+        if smoothing_bandwidth is not None and ts_norm is not None:
+            # Extract corresponding normalized timestamps for this segment
+            # The segment corresponds to indices [t : current_goal_idx + 1]
+            seg_ts_norm = ts_norm[t : current_goal_idx + 1]
+            dists = kernel_regression_smoothing(seg_ts_norm, dists, smoothing_bandwidth)
         
         score = calculate_monotonicity_score(dists)
         dynamic_distances[t] = dists[0]
@@ -506,21 +549,22 @@ def run_comparison():
         "device": "cuda:0",
         # "video_path": "/home/hubertchang/p-progress/vjepa2/videos/S4_Hotdog_C1_trim.mp4",
         # "video_path": "/home/hubertchang/p-progress/vjepa2/videos/fold.mp4",
-        # "video_path": "/home/hubertchang/p-progress/vjepa2/notebooks/droid_samples/episode_007/exterior_image_2_left.mp4",
-        "video_path": "/home/hubertchang/p-progress/vjepa2/notebooks/droid_samples/episode_028/exterior_image_1_left.mp4",
+        "video_path": "/home/hubertchang/p-progress/vjepa2/notebooks/droid_samples/episode_005/exterior_image_2_left.mp4",
+        # "video_path": "/home/hubertchang/p-progress/vjepa2/notebooks/droid_samples/episode_028/exterior_image_1_left.mp4",
         # "video_path": "/home/hubertchang/p-progress/vip/vip/examples/demo_hotdog/subgoal_09.mp4",
         "pt_model_path": "/tmp2/hubertchang/p-progress/models/vitg-384.pt",
         "output_dir": output_dir,
         "distance_metric": "l1", # 'l1' or 'l2'
         "subgoal": {
-            "monotonicity_thresholds": [-0.85, -0.9, -0.92, -0.95],
-            "time_threshold": 15
+            "monotonicity_thresholds": [-0.99],
+            "time_threshold": 20,
+            "smoothing_bandwidth": 0.1 # Set to None to disable
         },
         "configs": {
-            "VIP": {
-                "type": "vip",
-                "stride": 1
-            },
+            # "VIP": {
+            #     "type": "vip",
+            #     "stride": 1
+            # },
             "VJEPA_Single": {
                 "type": "vjepa",
                 "tau": 1,
@@ -531,11 +575,11 @@ def run_comparison():
             #     "tau": 2,
             #     "stride": 2
             # },
-            "VJEPA_Clip_8": {
-                "type": "vjepa",
-                "tau": 8,
-                "stride": 2
-            },
+            # "VJEPA_Clip_8": {
+            #     "type": "vjepa",
+            #     "tau": 8,
+            #     "stride": 2
+            # },
             # "VJEPA_Clip_16": {
             #     "type": "vjepa",
             #     "tau": 16,
@@ -605,10 +649,11 @@ def run_comparison():
             os.makedirs(sub_dir, exist_ok=True)
             
             goals_abs, dynamic_dists = discover_subgoals(
-                embs, indices, 
+                embs, indices, timestamps,
                 threshold=threshold, 
                 time_threshold=config["subgoal"]["time_threshold"],
-                distance_metric=config.get("distance_metric", "l2")
+                distance_metric=config.get("distance_metric", "l2"),
+                smoothing_bandwidth=config["subgoal"].get("smoothing_bandwidth", None)
             )
             
             goals_time = [g / fps for g in goals_abs]
