@@ -2,6 +2,10 @@
 .vscode/
 .*.swp
 
+*.mp4
+*.png
+*.gif
+
 run_vjepa_aws.py
 run.py
 main_distributed_video.py
