@@ -241,14 +241,15 @@ def kernel_regression_smoothing(x, y, bandwidth):
 
 def discover_subgoals(vectors, indices, timestamps, threshold=0.0, time_threshold=15, distance_metric='l2', smoothing_bandwidth=None):
     if len(vectors) == 0:
-        return [], np.array([])
+        return [], np.array([]), np.array([])
         
     vectors_tensor = torch.from_numpy(vectors)
     T = len(vectors)
     
     # Indices of identified goals (relative to the vectors array)
     goals_rel = [T - 1]
-    dynamic_distances = np.zeros(T)
+    dynamic_distances = np.zeros(T)          # possibly smoothed (used for discovery)
+    dynamic_distances_raw = np.zeros(T)      # always raw distances (no smoothing)
     current_goal_idx = T - 1
     
     # Normalize timestamps for smoothing if needed
@@ -269,67 +270,118 @@ def discover_subgoals(vectors, indices, timestamps, threshold=0.0, time_threshol
         
         diff = segment_vectors - target_goal.unsqueeze(0)
         if distance_metric == 'l1':
-            dists = torch.norm(diff, p=1, dim=1).numpy()
+            dists_raw = torch.norm(diff, p=1, dim=1).numpy()
         else:
-            dists = torch.norm(diff, p=2, dim=1).numpy()
-            
-        # Apply smoothing if requested
+            dists_raw = torch.norm(diff, p=2, dim=1).numpy()
+        
+        # Apply smoothing if requested (for discovery only)
+        dists_for_discovery = dists_raw
         if smoothing_bandwidth is not None and ts_norm is not None:
             # Extract corresponding normalized timestamps for this segment
             # The segment corresponds to indices [t : current_goal_idx + 1]
             seg_ts_norm = ts_norm[t : current_goal_idx + 1]
-            dists = kernel_regression_smoothing(seg_ts_norm, dists, smoothing_bandwidth)
+            dists_for_discovery = kernel_regression_smoothing(seg_ts_norm, dists_raw, smoothing_bandwidth)
         
-        score = calculate_monotonicity_score(dists)
-        dynamic_distances[t] = dists[0]
+        score = calculate_monotonicity_score(dists_for_discovery)
+        dynamic_distances[t] = dists_for_discovery[0]
+        dynamic_distances_raw[t] = dists_raw[0]
         
-        if len(dists) >= time_threshold and score > threshold:
+        # Use the (potentially) smoothed distances for the monotonicity length check
+        if len(dists_for_discovery) >= time_threshold and score > threshold:
              current_goal_idx = t
              goals_rel.append(t)
              dynamic_distances[t] = 0.0
+             dynamic_distances_raw[t] = 0.0
              
     goals_rel = sorted(goals_rel)
     dynamic_distances[T-1] = 0.0
+    dynamic_distances_raw[T-1] = 0.0
     
     # Map relative indices back to original frame indices
     goals_abs = [indices[g] for g in goals_rel]
     
-    return goals_abs, dynamic_distances
+    return goals_abs, dynamic_distances, dynamic_distances_raw
 
 # --- Plotting and Saving ---
 
-def plot_subgoal_discovery(timestamps, distances, goals, save_path, title_suffix="", distance_metric='l2'):
+def plot_subgoal_discovery(
+    timestamps,
+    distances_smooth,
+    distances_raw,
+    goals_time,
+    save_path,
+    title_suffix="",
+    distance_metric='l2',
+    smoothing_bandwidth=None,
+    monotonicity_threshold=None,
+):
+    """
+    Save a PNG snapshot corresponding conceptually to the first frame of the
+    backward GIF: full time extent, smoothed + raw curves, and subgoals chosen
+    from the smoothed curve.
+    """
     plt.figure(figsize=(12, 6))
-    plt.plot(timestamps, distances, label="Distance to Dynamic Goal", linewidth=1.5)
-    
-    # Plot goal markers
-    # goals contains frame indices, timestamps contains time for each frame in distances
-    # We need to find which index in 'timestamps' corresponds to 'goals'
-    # But 'timestamps' here are actually time values (float) passed from main loop
-    
-    # goals are absolute frame indices. 
-    # timestamps is a list of time values corresponding to the extracted vectors.
-    # We need to map goals (frame indices) to time values.
-    # However, 'timestamps' passed to this function are already aligned with 'distances'.
-    # So we need to find the index in the extracted sequence that corresponds to the goal frame.
-    
-    # Let's simplify: pass (extracted_indices, fps) instead of timestamps to map back.
-    # Or just pass goal_times directly if computed outside.
-    
-    # Assuming 'timestamps' is the x-axis data (time in seconds) for the curve 'distances'
-    # And 'goals' is a list of time values for the goals.
-    
-    plt.scatter(goals, [distances[np.argmin(np.abs(np.array(timestamps) - g))] for g in goals], 
-                c='red', marker='x', s=100, label="Discovered Subgoals", zorder=5)
-    
-    for gt in goals:
-        plt.axvline(x=gt, color='r', linestyle='--', alpha=0.3)
+
+    # Determine y-axis limits using both curves
+    all_dists = []
+    if len(distances_smooth) > 0:
+        all_dists.append(np.max(distances_smooth))
+    if distances_raw is not None and len(distances_raw) > 0:
+        all_dists.append(np.max(distances_raw))
+    max_dist = max(all_dists) if all_dists else 1.0
+
+    # Plot smoothed curve (used for discovery)
+    plt.plot(
+        timestamps,
+        distances_smooth,
+        label="Smoothed Distance",
+        linewidth=2,
+    )
+
+    # Plot raw / unsmoothed curve
+    if distances_raw is not None and len(distances_raw) == len(timestamps):
+        plt.plot(
+            timestamps,
+            distances_raw,
+            label="Raw Distance",
+            linewidth=1,
+            alpha=0.6,
+            linestyle="--",
+        )
+
+    # Plot goal markers based on smoothed distances
+    goal_dists = []
+    for g in goals_time:
+        idx = np.argmin(np.abs(np.array(timestamps) - g))
+        goal_dists.append(distances_smooth[idx])
+
+    if goals_time:
+        plt.scatter(
+            goals_time,
+            goal_dists,
+            c='red',
+            marker='x',
+            s=100,
+            label="Discovered Subgoals",
+            zorder=5,
+        )
+        for gt in goals_time:
+            plt.axvline(x=gt, color='r', linestyle='--', alpha=0.3)
+
+    title = f"Subgoal Discovery {title_suffix}"
+    if monotonicity_threshold is not None:
+        title += f"\nMono. Metric: Spearman | Thresh: {monotonicity_threshold}"
+    if smoothing_bandwidth is not None:
+        title += f"\nSmoothing BW: {smoothing_bandwidth}"
 
     plt.xlabel("Time (s)")
     plt.ylabel(f"{distance_metric.upper()} Distance to Current Subgoal")
-    plt.title(f"Subgoal Discovery {title_suffix}\nFound {len(goals)} goals")
+    plt.title(title)
+    plt.ylim(0, max_dist * 1.1)
+    plt.xlim(0, timestamps[-1] if len(timestamps) > 0 else 1.0)
     plt.legend()
     plt.grid(True)
+    plt.tight_layout()
     plt.savefig(save_path)
     print(f"Subgoal plot saved to {save_path}")
     plt.close()
@@ -364,7 +416,7 @@ def save_subgoal_videos(video_path, goals_time, output_dir):
     except Exception as e:
         print(f"Error saving video clips: {e}")
 
-def create_subgoal_discovery_gif(frames, timestamps, distances, goals_time, output_path, fps=30, title_suffix="", distance_metric='l2', monotonicity_threshold=None, smoothing_bandwidth=None, play_backward=False):
+def create_subgoal_discovery_gif(frames, timestamps, distances_smooth, distances_raw, goals_time, output_path, fps=30, title_suffix="", distance_metric='l2', monotonicity_threshold=None, smoothing_bandwidth=None, play_backward=False):
     print(f"Creating subgoal discovery GIF at {output_path}...")
     
     fig, ax = plt.subplots(nrows=1, ncols=2, figsize=(14, 6))
@@ -388,8 +440,13 @@ def create_subgoal_discovery_gif(frames, timestamps, distances, goals_time, outp
     max_time = timestamps[-1] if len(timestamps) > 0 else 1.0
     ax[0].set_xlim(0, max_time)
     
-    # Determine y-axis limits
-    max_dist = np.max(distances) if len(distances) > 0 else 1.0
+    # Determine y-axis limits (consider both raw and smoothed)
+    all_dists = []
+    if len(distances_smooth) > 0:
+        all_dists.append(np.max(distances_smooth))
+    if distances_raw is not None and len(distances_raw) > 0:
+        all_dists.append(np.max(distances_raw))
+    max_dist = max(all_dists) if all_dists else 1.0
     ax[0].set_ylim(0, max_dist * 1.1)
 
     def animate(i):
@@ -407,22 +464,28 @@ def create_subgoal_discovery_gif(frames, timestamps, distances, goals_time, outp
         # Let's find the timestamp closest to current frame time
         current_time = i / fps
         
-        # Plot full curve up to current time
+        # Plot full curves up to current time
         valid_mask = np.array(timestamps) <= current_time
         if np.any(valid_mask):
             curr_timestamps = np.array(timestamps)[valid_mask]
-            curr_dists = distances[valid_mask]
-            ax[0].plot(curr_timestamps, curr_dists, label="Distance", linewidth=2)
+            # Smoothed curve (used for discovery)
+            curr_dists_smooth = distances_smooth[valid_mask]
+            ax[0].plot(curr_timestamps, curr_dists_smooth, label="Smoothed Distance", linewidth=2)
+            
+            # Raw / unsmoothed curve
+            if distances_raw is not None and len(distances_raw) == len(timestamps):
+                curr_dists_raw = distances_raw[valid_mask]
+                ax[0].plot(curr_timestamps, curr_dists_raw, label="Raw Distance", linewidth=1, alpha=0.6, linestyle="--")
             
             # Plot discovered goals that have been passed
             passed_goals = [g for g in goals_time if g <= current_time]
             
-            # Find distances for passed goals
+            # Find smoothed distances for passed goals (conditioning on smoothed discovery)
             passed_goal_dists = []
             for g in passed_goals:
                 # Find closest timestamp index
                 idx = np.argmin(np.abs(np.array(timestamps) - g))
-                passed_goal_dists.append(distances[idx])
+                passed_goal_dists.append(distances_smooth[idx])
                 
             if passed_goals:
                 ax[0].scatter(passed_goals, passed_goal_dists, c='red', marker='x', s=100, label="Subgoals", zorder=5)
@@ -554,7 +617,7 @@ def run_comparison():
     output_dir = f"outputs/compare_{timestamp}"
     
     config = {
-        "device": "cuda:0",
+        "device": "cuda:1",
         # "video_path": "/home/hubertchang/p-progress/vjepa2/videos/S4_Hotdog_C1_trim.mp4",
         # "video_path": "/home/hubertchang/p-progress/vjepa2/videos/fold.mp4",
         "video_path": "/home/hubertchang/p-progress/vjepa2/notebooks/droid_samples/episode_005/exterior_image_2_left.mp4",
@@ -566,7 +629,7 @@ def run_comparison():
         "subgoal": {
             "monotonicity_thresholds": [-0.99],
             "time_threshold": 20,
-            "smoothing_bandwidth": 0.1 # Set to None to disable
+            "smoothing_bandwidth": 0.02 # Set to None to disable
         },
         "configs": {
             # "VIP": {
@@ -656,7 +719,7 @@ def run_comparison():
             sub_dir = os.path.join(output_dir, name, f"thresh_{threshold}")
             os.makedirs(sub_dir, exist_ok=True)
             
-            goals_abs, dynamic_dists = discover_subgoals(
+            goals_abs, dynamic_dists, dynamic_dists_raw = discover_subgoals(
                 embs, indices, timestamps,
                 threshold=threshold, 
                 time_threshold=config["subgoal"]["time_threshold"],
@@ -667,14 +730,19 @@ def run_comparison():
             goals_time = [g / fps for g in goals_abs]
             
             plot_subgoal_discovery(
-                timestamps, dynamic_dists, goals_time, 
+                timestamps,
+                dynamic_dists,
+                dynamic_dists_raw,
+                goals_time,
                 save_path=os.path.join(sub_dir, "subgoal_discovery.png"),
                 title_suffix=f"({name})",
-                distance_metric=config.get("distance_metric", "l2")
+                distance_metric=config.get("distance_metric", "l2"),
+                smoothing_bandwidth=config["subgoal"].get("smoothing_bandwidth", None),
+                monotonicity_threshold=threshold,
             )
             
             create_subgoal_discovery_gif(
-                frames, timestamps, dynamic_dists, goals_time,
+                frames, timestamps, dynamic_dists, dynamic_dists_raw, goals_time,
                 output_path=os.path.join(sub_dir, "subgoal_discovery.gif"),
                 fps=fps,
                 title_suffix=f"({name})",
@@ -686,7 +754,7 @@ def run_comparison():
             
             # Backward playback GIF for subgoal discovery
             create_subgoal_discovery_gif(
-                frames, timestamps, dynamic_dists, goals_time,
+                frames, timestamps, dynamic_dists, dynamic_dists_raw, goals_time,
                 output_path=os.path.join(sub_dir, "subgoal_discovery_backward.gif"),
                 fps=fps,
                 title_suffix=f"({name}, Backward Playback)",
