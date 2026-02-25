@@ -15,6 +15,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from typing import Optional
 
 # Video path pattern from DROID meta/info.json:
@@ -116,25 +117,61 @@ def download_metadata(cache_dir: str):
     print(f"Metadata cached under: {cache_dir}")
 
 
-def download_videos_snapshot(cache_dir: str, max_workers: int = 32):
+def download_videos_snapshot(
+    cache_dir: str,
+    max_workers: int = 32,
+    max_retries: int = 5,
+):
     """
     Download only the videos/ tree using snapshot_download with parallel workers.
     Much faster than one-by-one (single API listing + many concurrent downloads).
+
+    Resume: Re-run the same command after an interruption. Existing files in
+    local_dir are skipped (force_download=False); only missing files are fetched.
     """
     from huggingface_hub import snapshot_download
 
     # Download into a folder that mirrors the repo; only videos/** are fetched
     local_dir = os.path.join(cache_dir, "droid_repo")
     os.makedirs(cache_dir, exist_ok=True)
+    if os.path.isdir(local_dir) and any(os.scandir(local_dir)):
+        print(f"Resuming: existing content in {local_dir} will be skipped; only missing files will be downloaded.")
     print(f"Downloading cadene/droid (videos only) with {max_workers} workers → {local_dir}")
-    snapshot_download(
-        repo_id=DROID_REPO_ID,
-        repo_type="dataset",
-        local_dir=local_dir,
-        allow_patterns=["videos/**"],
-        max_workers=max_workers,
-    )
-    print(f"Videos saved under: {local_dir}/videos/")
+
+    last_exc = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            snapshot_download(
+                repo_id=DROID_REPO_ID,
+                repo_type="dataset",
+                local_dir=local_dir,
+                allow_patterns=["videos/**"],
+                max_workers=max_workers,
+                force_download=False,  # skip existing files (resume)
+            )
+            print(f"Videos saved under: {local_dir}/videos/")
+            return
+        except Exception as e:
+            last_exc = e
+            err_str = str(e).lower()
+            is_connection_error = (
+                "connection reset" in err_str
+                or "errno 104" in err_str
+                or "readerror" in err_str
+                or "connection" in err_str and ("reset" in err_str or "refused" in err_str)
+            )
+            if is_connection_error and attempt < max_retries:
+                wait = min(60 * attempt, 300)
+                print(f"Connection error (attempt {attempt}/{max_retries}): {e}")
+                print(f"Retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                break
+    print("Download stopped.", file=sys.stderr)
+    if last_exc:
+        print(f"Last error: {last_exc}", file=sys.stderr)
+    print("Re-run the same command to resume; already-downloaded files will be skipped.", file=sys.stderr)
+    raise SystemExit(1)
 
 
 def download_videos_git_lfs(cache_dir: str, concurrent_transfers: int = 20):
