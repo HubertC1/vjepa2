@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 import torchvision.io as io
+from PIL import Image
 from scipy.stats import spearmanr
 from matplotlib import pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
@@ -266,6 +267,7 @@ def _discover_subgoals_internal(
 
     goals_rel = [T - 1]
     current_goal_idx = T - 1
+    min_goal_index = max(int(time_threshold), 0)
 
     dynamic_distances = np.zeros(T, dtype=np.float32)
     dynamic_distances_raw = np.zeros(T, dtype=np.float32)
@@ -291,14 +293,20 @@ def _discover_subgoals_internal(
         dynamic_distances[t] = dists_for_discovery[0]
         dynamic_distances_raw[t] = dists_raw[0]
 
-        if len(dists_for_discovery) >= time_threshold and score > threshold:
+        # Only accept/reset to a discovered subgoal when it is far enough from
+        # the start. This avoids introducing artificial dips for subgoals that
+        # would later be filtered out for being too close to initialization.
+        if (
+            t >= min_goal_index
+            and len(dists_for_discovery) >= time_threshold
+            and score > threshold
+        ):
             current_goal_idx = t
             goals_rel.append(t)
             dynamic_distances[t] = 0.0
             dynamic_distances_raw[t] = 0.0
 
     goals_rel = sorted(goals_rel)
-    min_goal_index = max(int(time_threshold), 0)
     goals_rel = [g for g in goals_rel if g == (T - 1) or g >= min_goal_index]
     if T > 0:
         dynamic_distances[T - 1] = 0.0
@@ -540,6 +548,36 @@ def create_subgoal_discovery_gif(
     ani = FuncAnimation(fig, animate, interval=1000 / gif_fps, repeat=False, frames=animation_frames)
     ani.save(output_path, dpi=100, writer=PillowWriter(fps=gif_fps))
     plt.close()
+
+
+def save_discovered_subgoal_frames(
+    frames: np.ndarray,
+    goals_rel: List[int],
+    frame_indices: np.ndarray,
+    output_dir: str,
+    image_size: int = 256,
+) -> None:
+    """
+    Save discovered subgoal frames as resized PNG images.
+    """
+    if len(frames) == 0 or not goals_rel:
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+    for subgoal_idx, rel_idx in enumerate(goals_rel):
+        if rel_idx < 0 or rel_idx >= len(frames):
+            continue
+
+        frame_np = frames[rel_idx]
+        # Ensure uint8 RGB image for PIL.
+        if frame_np.dtype != np.uint8:
+            frame_np = np.clip(frame_np, 0, 255).astype(np.uint8)
+        img = Image.fromarray(frame_np)
+        img = img.resize((image_size, image_size), resample=Image.BICUBIC)
+
+        abs_idx = int(frame_indices[rel_idx]) if rel_idx < len(frame_indices) else -1
+        out_name = f"subgoal_{subgoal_idx:03d}_rel_{rel_idx:05d}_abs_{abs_idx:06d}.png"
+        img.save(os.path.join(output_dir, out_name))
 
 
 def make_output_h5_path(base_path: str, file_index: int) -> str:
@@ -893,6 +931,7 @@ def main():
 
                     png_path = os.path.join(video_debug_dir, "subgoal_discovery.png")
                     gif_path = os.path.join(video_debug_dir, "subgoal_discovery.gif")
+                    subgoal_frames_dir = os.path.join(video_debug_dir, "subgoal_frames")
 
                     plot_subgoal_discovery(
                         timestamps=timestamps,
@@ -916,6 +955,13 @@ def main():
                         title_suffix="",
                         monotonicity_threshold=args.monotonicity_threshold,
                         smoothing_bandwidth=args.smoothing_bandwidth,
+                    )
+                    save_discovered_subgoal_frames(
+                        frames=frames_debug.numpy(),
+                        goals_rel=goals_rel_dbg,
+                        frame_indices=fi_i,
+                        output_dir=subgoal_frames_dir,
+                        image_size=256,
                     )
 
             dt = time.perf_counter() - t0
