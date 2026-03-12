@@ -306,8 +306,12 @@ def _discover_subgoals_internal(
             dynamic_distances[t] = 0.0
             dynamic_distances_raw[t] = 0.0
 
-    goals_rel = sorted(goals_rel)
+    goals_rel = sorted(set(goals_rel))
     goals_rel = [g for g in goals_rel if g == (T - 1) or g >= min_goal_index]
+    # Always keep the very first sampled frame as a subgoal anchor so downstream
+    # pairwise planning can start from the true initial state.
+    if T > 0 and 0 not in goals_rel:
+        goals_rel = [0] + goals_rel
     if T > 0:
         dynamic_distances[T - 1] = 0.0
         dynamic_distances_raw[T - 1] = 0.0
