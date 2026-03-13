@@ -252,7 +252,7 @@ def main():
     )
     args, _ = parser.parse_known_args()
 
-    device = "cuda:1" if torch.cuda.is_available() else "cpu"
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
     # ---- task setup ----
@@ -294,7 +294,7 @@ def main():
 
     mpc_args = {
         "rollout": 4,
-        "samples": 150,
+        "samples": 10,
         "topk": 10,
         "cem_steps": 10,
         "momentum_mean": 0.15,
@@ -332,7 +332,9 @@ def main():
         return action
 
     def latent_energy(rep, goal_rep):
-        return float(torch.mean(torch.abs(rep - goal_rep)).item())
+        rep = rep.flatten(1)
+        goal_rep = goal_rep.flatten(1)
+        return torch.mean(torch.abs(goal_rep - rep), dim=-1).item()
 
     def predict_next_rep_from_action(rep, pose_7d, action_7d):
         action_t = torch.tensor(action_7d, dtype=torch.float32, device=device)[None, None]

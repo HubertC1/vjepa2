@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import torchvision.io as io
 from PIL import Image
@@ -13,7 +14,6 @@ from matplotlib import pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
 
 from app.vjepa_droid.transforms import make_transforms
-from src.models.vision_transformer import vit_giant_xformers_rope
 
 
 def find_mp4s(root: str) -> List[str]:
@@ -185,11 +185,12 @@ def forward_target_batched(
     crop_size: int,   # kept for API symmetry with train.py, unused here
     patch_size: int,  # kept for API symmetry with train.py, unused here
     dtype: torch.dtype,
+    normalize_reps: bool = True,
 ) -> torch.Tensor:
     """
     Mirror forward_target() from train.py, but:
       - take batched clips [B, C, T, H, W]
-      - return per-frame embeddings [B, T, D]
+      - return per-frame token embeddings [B, T, N_tokens, D]
     """
     clips = clips.to(device, non_blocking=True)  # [B, C, T, H, W]
     B, C, T, H, W = clips.shape
@@ -209,11 +210,9 @@ def forward_target_batched(
     if BT != B * T:
         raise RuntimeError(f"Unexpected BT: {BT}, expected {B*T}")
 
-    # Match train.py semantics: treat all tokens per frame as a set, without
-    # enforcing a specific temporal structure in the token dimension.
-    # [B*T, N_tokens, D] -> [B, T, N_tokens, D] -> mean over tokens -> [B, T, D]
-    # h = h.view(B, T, n_tokens, D).mean(dim=2)
     h = h.view(B, T, n_tokens, D)
+    if normalize_reps:
+        h = F.layer_norm(h, (h.size(-1),))
     return h
 
 
@@ -281,8 +280,14 @@ def _discover_subgoals_internal(
     for t in range(T - 2, -1, -1):
         segment_vectors = vectors_tensor[t : current_goal_idx + 1]  # [L, N, D]
         target_goal = vectors_tensor[current_goal_idx]  # [N, D]
-        diff = segment_vectors - target_goal.unsqueeze(0)  # [L, N, D]
-        dists_raw = torch.mean(torch.abs(diff), dim=(1, 2)).numpy()  # [L]
+        target_goal = target_goal.unsqueeze(0)
+        segment_vectors = segment_vectors.flatten(1) #[L, N*D]
+        target_goal = target_goal.flatten(1) #[1, N*D]
+        # diff = segment_vectors - target_goal.unsqueeze(0)  # [L, N, D]
+
+        # dists_raw = torch.mean(torch.abs(diff), dim=(1, 2)).numpy()  # [L]
+        # to use the same distance in mpc_utils.py
+        dists_raw = torch.mean(torch.abs(segment_vectors - target_goal), dim=-1).cpu().numpy()  # [L]
 
         dists_for_discovery = dists_raw
         if smoothing_bandwidth is not None and ts_norm is not None:
@@ -617,8 +622,8 @@ def main():
     parser.add_argument(
         "--vjepa_checkpoint",
         type=str,
-        required=True,
-        help="Path to VJEPA checkpoint.",
+        default=None,
+        help="Deprecated: not used when loading encoder from torch hub.",
     )
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--batch_size", type=int, default=16, help="Number of videos per encoder forward.")
@@ -651,6 +656,12 @@ def main():
         default="float32",
         choices=["float32", "float16", "bfloat16"],
         help="Inference dtype for the encoder.",
+    )
+    parser.add_argument(
+        "--normalize_reps",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply layer_norm to token reps to match train.py/world_model_wrapper behavior.",
     )
     parser.add_argument(
         "--monotonicity_threshold",
@@ -738,18 +749,9 @@ def main():
             f"with target_fps={args.target_fps} -> effective_time_threshold={effective_time_threshold} steps"
         )
 
-    target_encoder = vit_giant_xformers_rope(img_size=(args.crop_size, args.crop_size), num_frames=args.max_num_frames)
-    ckpt = torch.load(args.vjepa_checkpoint, map_location="cpu")
-    if "encoder" in ckpt:
-        ckpt = ckpt["encoder"]
-    ckpt = {k.replace("module.", ""): v for k, v in ckpt.items()}
-    ckpt = {k.replace("backbone.", ""): v for k, v in ckpt.items()}
-    msg = target_encoder.load_state_dict(ckpt, strict=False)
-    print(f"Loaded VJEPA encoder with msg: {msg}")
-
-
-    target_encoder = target_encoder.to(device)
-    target_encoder.eval()
+    # Match libero_plan.py model loading path.
+    target_encoder, _ = torch.hub.load("facebookresearch/vjepa2", "vjepa2_ac_vit_giant")
+    target_encoder = target_encoder.to(device).eval()
     for p in target_encoder.parameters():
         p.requires_grad = False
 
@@ -838,6 +840,7 @@ def main():
                     crop_size=args.crop_size,
                     patch_size=args.patch_size,
                     dtype=dtype,
+                    normalize_reps=args.normalize_reps,
                 )  # [B, T, N_tokens, D]
             except Exception as e:
                 print(f"Failed to encode batch {batch_idx}: {e}")
